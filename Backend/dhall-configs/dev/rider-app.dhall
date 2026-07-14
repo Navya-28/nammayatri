@@ -545,4 +545,10 @@ in  { esqDBCfg
     , bapHostRedirectMap = [] : List { mapKey : Text, mapValue : Optional Text }
     , xyneWebhookSigningSecret = "<XYNE_WEBHOOK_SIGNING_SECRET>"
     , xyneWebhookBearerToken = "<XYNE_WEBHOOK_BEARER_TOKEN>"
+    , metaBotEnabled = True
+    , metaAllowedPhones = [ "9361176218", "9343922922", "6374989436" ]
+    , metaTrackerEnabled = True
+    , metaTrackerPollMs = +3000
+    , metaSessionTtlSec = +1800
+    , metaTrackerMaxAgeSec = +10800
     }
