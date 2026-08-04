@@ -31,6 +31,7 @@ import qualified API.Action.Dashboard.Management.Payout
 import qualified API.Action.Dashboard.Management.PlanManagement
 import qualified API.Action.Dashboard.Management.Revenue
 import qualified API.Action.Dashboard.Management.Ride
+import qualified API.Action.Dashboard.Management.ScheduledBooking
 import qualified API.Action.Dashboard.Management.SearchTry
 import qualified API.Action.Dashboard.Management.SosMedia
 import qualified API.Action.Dashboard.Management.SpecialZoneQueue

@@ -27,6 +27,7 @@ import qualified API.Action.ProviderPlatform.Management.Payout
 import qualified API.Action.ProviderPlatform.Management.PlanManagement
 import qualified API.Action.ProviderPlatform.Management.Revenue
 import qualified API.Action.ProviderPlatform.Management.Ride
+import qualified API.Action.ProviderPlatform.Management.ScheduledBooking
 import qualified API.Action.ProviderPlatform.Management.SearchTry
 import qualified API.Action.ProviderPlatform.Management.SosMedia
 import qualified API.Action.ProviderPlatform.Management.SpecialZoneQueue
