@@ -539,6 +539,7 @@ library
       SharedLogic.NyRegularSubscriptionHasher
       SharedLogic.NySubscription
       SharedLogic.Offer
+      SharedLogic.OfferSegment
       SharedLogic.OfferTypes
       SharedLogic.OTP
       SharedLogic.PassExpiryReminder
@@ -547,6 +548,7 @@ library
       SharedLogic.PaymentVendorSplits
       SharedLogic.Person
       SharedLogic.PersonDefaultEmergencyNumber
+      SharedLogic.PersonPTStats
       SharedLogic.PickupETA
       SharedLogic.PTCircuitBreaker
       SharedLogic.PublicTransport
@@ -1169,6 +1171,7 @@ library
       Domain.Types.Person
       Domain.Types.PersonDisability
       Domain.Types.PersonFlowStatus
+      Domain.Types.PersonPTStats
       Domain.Types.PersonStats
       Domain.Types.PickupInstructions
       Domain.Types.PlaceBasedServiceConfig
@@ -1337,6 +1340,7 @@ library
       Storage.Beam.PayoutConfig
       Storage.Beam.Person
       Storage.Beam.PersonDisability
+      Storage.Beam.PersonPTStats
       Storage.Beam.PersonStats
       Storage.Beam.PickupInstructions
       Storage.Beam.PlaceBasedServiceConfig
@@ -1535,6 +1539,7 @@ library
       Storage.Queries.OrphanInstances.PassType
       Storage.Queries.OrphanInstances.PassVerifyTransaction
       Storage.Queries.OrphanInstances.Person
+      Storage.Queries.OrphanInstances.PersonPTStats
       Storage.Queries.OrphanInstances.PersonStats
       Storage.Queries.OrphanInstances.PlaceBasedServiceConfig
       Storage.Queries.OrphanInstances.PopularLocation
@@ -1585,6 +1590,7 @@ library
       Storage.Queries.PayoutConfig
       Storage.Queries.Person
       Storage.Queries.PersonDisability
+      Storage.Queries.PersonPTStats
       Storage.Queries.PersonStats
       Storage.Queries.PickupInstructions
       Storage.Queries.PlaceBasedServiceConfig
