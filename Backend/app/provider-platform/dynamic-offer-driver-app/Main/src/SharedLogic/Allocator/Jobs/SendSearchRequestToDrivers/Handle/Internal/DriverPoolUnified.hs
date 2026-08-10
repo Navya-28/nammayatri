@@ -1,13 +1,17 @@
 module SharedLogic.Allocator.Jobs.SendSearchRequestToDrivers.Handle.Internal.DriverPoolUnified where
 
+import qualified Control.Monad.Catch as C
 import Control.Monad.Extra (partitionM)
+import qualified Dashboard.Common as DC
 import Data.Aeson
 import qualified Data.Aeson.Key as AK
 import qualified Data.Aeson.KeyMap as AKM
+import qualified Data.HashMap.Strict as HashMap
 import qualified Data.List as DL
 import qualified Data.Map as Map
 import Data.Maybe (listToMaybe)
 import qualified Data.Text as T
+import Domain.Action.UI.Driver (acceptDynamicOfferDriverRequest)
 import Domain.Types.Common
 import Domain.Types.DriverGoHomeRequest as DDGR
 import Domain.Types.DriverPoolConfig
@@ -17,28 +21,39 @@ import qualified Domain.Types.Merchant as DM
 import Domain.Types.MerchantOperatingCity (MerchantOperatingCity)
 import Domain.Types.Person (Driver)
 import qualified Domain.Types.SearchRequest as DSR
+import Domain.Types.SearchRequestForDriver (DriverSearchRequestStatus (Inactive))
 import qualified Domain.Types.SearchTry as DST
 import qualified Domain.Types.TransporterConfig as DTC
 import qualified Domain.Types.VehicleServiceTier as DVST
 import EulerHS.Prelude hiding (id)
+import Kernel.External.Types (ServiceFlow)
+import Kernel.Prelude (NominalDiffTime)
 import Kernel.Storage.Clickhouse.Config
 import qualified Kernel.Storage.ClickhouseV2 as CHV2
 import Kernel.Storage.Esqueleto.Config (EsqDBReplicaFlow)
 import qualified Kernel.Storage.Hedis as Redis
 import Kernel.Streaming.Kafka.Producer.Types (HasKafkaProducer)
+import Kernel.Tools.Metrics.CoreMetrics.Types (CoreMetrics, DeploymentVersion)
 import Kernel.Types.Error
 import Kernel.Types.Id
 import Kernel.Utils.Common
 import Kernel.Utils.DatastoreLatencyCalculator
 import Lib.ConfigPilot.Interface.Types (getOneConfig)
+import Lib.Finance.Storage.Beam.BeamFlow (BeamFlow)
 import Lib.Queries.GateInfo
+import Lib.SessionizerMetrics.Types.Event (EventStreamFlow)
 import qualified Lib.Types.SpecialLocation as SL
 import qualified Lib.Yudhishthira.Types as LYT
 import qualified SharedLogic.AirportEntryFee as AirportEntryFee
 import qualified SharedLogic.Allocator.Jobs.SendSearchRequestToDrivers.Handle.Internal.DriverPool as SDP
+import SharedLogic.Allocator.Jobs.SendSearchRequestToDrivers.Handle.Internal.SendSearchRequestToDrivers (buildSearchRequestForDriver)
 import qualified SharedLogic.Beckn.Common as DTS
+import qualified SharedLogic.CallInternalMLPricing as ML
 import SharedLogic.DriverPool
 import qualified SharedLogic.External.LocationTrackingService.Types as LT
+import qualified SharedLogic.Finance.Prepaid as SFPrepaid
+import qualified SharedLogic.Finance.Wallet as SFWallet
+import SharedLogic.Ride (offerQuoteLockKeyWithCoolDown)
 import Storage.Beam.SpecialZone ()
 import Storage.Beam.Yudhishthira ()
 import qualified Storage.CachedQueries.Driver.GoHomeRequest as CQDGR
@@ -46,8 +61,17 @@ import qualified Storage.CachedQueries.Merchant as CQM
 import qualified Storage.CachedQueries.ValueAddNP as CQVAN
 import qualified Storage.CachedQueries.VehicleServiceTier as CQVST
 import Storage.ConfigPilot.Config.TransporterConfig (TransporterConfigDimensions (..))
+import qualified Storage.Queries.DriverInformation as QDI
+import qualified Storage.Queries.DriverQuote as QDrQt
+import qualified Storage.Queries.DriverStats as QDriverStats
+import qualified Storage.Queries.Person as QPerson
+import Storage.Queries.Person.GetNearestDrivers (isDriverModeEligibleHelper)
 import qualified Storage.Queries.RiderDriverCorrelation as QFavDrivers
+import qualified Storage.Queries.SearchRequestForDriver as QSRD
+import qualified Storage.Queries.Vehicle as QVehicle
+import Tools.Error (DriverInformationError (DriverInfoNotFound))
 import Tools.Maps as Maps
+import TransactionLogs.Types (KeyConfig, TokenConfig)
 
 getNextDriverPoolBatch ::
   ( EncFlow m r,
@@ -60,10 +84,30 @@ getNextDriverPoolBatch ::
     HasField "enableAPILatencyLogging" r Bool,
     HasField "enableAPIPrometheusMetricLogging" r Bool,
     Redis.HedisLTSFlowEnv r,
+    Redis.HedisFlow m r,
     HasField "secondaryLTSHedisEnv" r (Maybe Redis.HedisEnv),
     CHV2.HasClickhouseEnv CHV2.APP_SERVICE_CLICKHOUSE m,
     ClickhouseFlow m r,
-    HasField "enableLtsPoolDataForPooling" r Bool
+    HasField "enableLtsPoolDataForPooling" r Bool,
+    BeamFlow m r,
+    CoreMetrics m,
+    MonadReader r m,
+    HasFlowEnv m r '["mlPricingInternal" ::: ML.MLPricingInternal],
+    HasFlowEnv m r '["internalEndPointHashMap" ::: HashMap.HashMap BaseUrl BaseUrl],
+    HasFlowEnv m r '["ondcTokenHashMap" ::: HashMap.HashMap KeyConfig TokenConfig],
+    HasFlowEnv m r '["nwAddress" ::: BaseUrl],
+    HasFlowEnv m r '["maxNotificationShards" ::: Int],
+    HasField "serviceClickhouseCfg" r ClickhouseCfg,
+    HasField "serviceClickhouseEnv" r ClickhouseEnv,
+    HasField "driverQuoteExpirationSeconds" r NominalDiffTime,
+    HasField "version" r DeploymentVersion,
+    HasFlowEnv m r '["version" ::: DeploymentVersion],
+    HasHttpClientOptions r c,
+    EventStreamFlow m r,
+    HasPrettyLogger m r,
+    ServiceFlow m r,
+    HasField "quoteRespondCoolDown" r Int,
+    HasField "driverUnlockDelay" r Seconds
   ) =>
   DriverPoolConfig ->
   DSR.SearchRequest ->
@@ -109,10 +153,30 @@ prepareDriverPoolBatch ::
     HasField "enableAPILatencyLogging" r Bool,
     HasField "enableAPIPrometheusMetricLogging" r Bool,
     Redis.HedisLTSFlowEnv r,
+    Redis.HedisFlow m r,
     HasField "secondaryLTSHedisEnv" r (Maybe Redis.HedisEnv),
     CHV2.HasClickhouseEnv CHV2.APP_SERVICE_CLICKHOUSE m,
     ClickhouseFlow m r,
-    HasField "enableLtsPoolDataForPooling" r Bool
+    HasField "enableLtsPoolDataForPooling" r Bool,
+    BeamFlow m r,
+    CoreMetrics m,
+    MonadReader r m,
+    HasFlowEnv m r '["mlPricingInternal" ::: ML.MLPricingInternal],
+    HasFlowEnv m r '["internalEndPointHashMap" ::: HashMap.HashMap BaseUrl BaseUrl],
+    HasFlowEnv m r '["ondcTokenHashMap" ::: HashMap.HashMap KeyConfig TokenConfig],
+    HasFlowEnv m r '["nwAddress" ::: BaseUrl],
+    HasFlowEnv m r '["maxNotificationShards" ::: Int],
+    HasField "serviceClickhouseCfg" r ClickhouseCfg,
+    HasField "serviceClickhouseEnv" r ClickhouseEnv,
+    HasField "driverQuoteExpirationSeconds" r NominalDiffTime,
+    HasField "version" r DeploymentVersion,
+    HasFlowEnv m r '["version" ::: DeploymentVersion],
+    HasHttpClientOptions r c,
+    EventStreamFlow m r,
+    HasPrettyLogger m r,
+    ServiceFlow m r,
+    HasField "quoteRespondCoolDown" r Int,
+    HasField "driverUnlockDelay" r Seconds
   ) =>
   [DVST.VehicleServiceTier] ->
   DM.Merchant ->
@@ -130,10 +194,16 @@ prepareDriverPoolBatch cityServiceTiers merchant driverPoolCfg searchReq searchT
   previousBatchesDriversOnRide <- getPreviousBatchesDrivers (Just True)
   let merchantOpCityId = searchReq.merchantOperatingCityId
   logDebug $ "PreviousBatchesDrivers-" <> show previousBatchesDrivers
-  SDP.PrepareDriverPoolBatchEntity {..} <- withTimeAPI "driverPooling" "prepareDriverPoolBatch'" $ prepareDriverPoolBatch' previousBatchesDrivers startingbatchNum merchantOpCityId searchReq.transactionId isValueAddNP
+  -- Fetched once, threaded to both prepareDriverPoolBatch' and attemptPriorityDirectAssign --
+  -- avoids each re-fetching the same config per batch on this hot allocator loop.
+  transporterConfig <- getOneConfig (TransporterConfigDimensions {merchantOperatingCityId = merchantOpCityId.getId}) Nothing >>= fromMaybeM (TransporterConfigDoesNotExist merchantOpCityId.getId)
+  SDP.PrepareDriverPoolBatchEntity {..} <- withTimeAPI "driverPooling" "prepareDriverPoolBatch'" $ prepareDriverPoolBatch' previousBatchesDrivers startingbatchNum merchantOpCityId searchReq.transactionId isValueAddNP transporterConfig
   let finalPool = currentDriverPoolBatch <> currentDriverPoolBatchOnRide
   SDP.incrementDriverRequestCount finalPool searchTry.id
-  pure $ buildDriverPoolWithActualDistResultWithFlags finalPool poolType nextScheduleTime (previousBatchesDrivers <> previousBatchesDriversOnRide)
+  -- Priority direct-assign only targets not-on-ride candidates; on-ride drivers always broadcast normally.
+  notOnRideAfterPriority <- attemptPriorityDirectAssign merchant searchReq searchTry tripQuoteDetails cityServiceTiers driverPoolCfg startingbatchNum transporterConfig currentDriverPoolBatch
+  let poolToBroadcast = notOnRideAfterPriority <> currentDriverPoolBatchOnRide
+  pure $ buildDriverPoolWithActualDistResultWithFlags poolToBroadcast poolType nextScheduleTime (previousBatchesDrivers <> previousBatchesDriversOnRide)
   where
     buildDriverPoolWithActualDistResultWithFlags finalPool poolType nextScheduleTime prevBatchDrivers =
       DriverPoolWithActualDistResultWithFlags
@@ -157,8 +227,11 @@ prepareDriverPoolBatch cityServiceTiers merchant driverPoolCfg searchReq searchT
       batches <- SDP.previouslyAttemptedDrivers searchTry.id mbOnRide
       return $ fst <$> batches
 
-    prepareDriverPoolBatch' previousBatchesDrivers batchNum merchantOpCityId txnId isValueAddNP = withLogTag ("BatchNum - " <> show batchNum <> " and txnId:- " <> show txnId) $ do
-      transporterConfig <- getOneConfig (TransporterConfigDimensions {merchantOperatingCityId = merchantOpCityId.getId}) Nothing >>= fromMaybeM (TransporterConfigDoesNotExist merchantOpCityId.getId)
+    prepareDriverPoolBatch' previousBatchesDrivers batchNum merchantOpCityId txnId isValueAddNP batchTransporterConfig = withLogTag ("BatchNum - " <> show batchNum <> " and txnId:- " <> show txnId) $ do
+      -- Renamed to avoid shadowing: nested where-helpers below (calcDriverPool,
+      -- calculateNormalBatch, etc.) already have their own local `transporterConfig`, and a
+      -- same-named param (unlike a do-bind) would be visible to them.
+      let transporterConfig = batchTransporterConfig
       airportEntryFee <-
         if fromMaybe False transporterConfig.airportEntryFeeCheckAtStartRide
           then pure Nothing
@@ -532,3 +605,157 @@ extractPriorityDriverTags = maybe [] (mapMaybe extractTag)
     extractTag (LYT.TagNameValue raw) = case T.stripPrefix priorityDriverTagPrefix raw of
       Just name | not (T.null name) -> Just name
       _ -> Nothing
+
+-- | For each batch, before broadcast, try to directly assign one of this batch's
+-- InstantAssign#<tier>-tagged drivers (tiers with instantAcceptanceConfig.enabled=true),
+-- nearest-first, without ever notifying them — only the resulting "ride assigned" push (via the
+-- rider's existing autoAssignEnabledV2 auto-confirm chain) tells them anything happened. On
+-- success, returns [] (nothing broadcasts, the ride's already taken); on failure, returns the
+-- batch unchanged for normal broadcast. Only targets not-on-ride candidates.
+attemptPriorityDirectAssign ::
+  forall m r c.
+  ( EncFlow m r,
+    EsqDBReplicaFlow m r,
+    EsqDBFlow m r,
+    CacheFlow m r,
+    LT.HasLocationService m r,
+    HasKafkaProducer r,
+    HasShortDurationRetryCfg r c,
+    HasField "enableAPILatencyLogging" r Bool,
+    HasField "enableAPIPrometheusMetricLogging" r Bool,
+    Redis.HedisLTSFlowEnv r,
+    Redis.HedisFlow m r,
+    HasField "secondaryLTSHedisEnv" r (Maybe Redis.HedisEnv),
+    CHV2.HasClickhouseEnv CHV2.APP_SERVICE_CLICKHOUSE m,
+    ClickhouseFlow m r,
+    HasField "enableLtsPoolDataForPooling" r Bool,
+    BeamFlow m r,
+    CoreMetrics m,
+    MonadReader r m,
+    HasFlowEnv m r '["mlPricingInternal" ::: ML.MLPricingInternal],
+    HasFlowEnv m r '["internalEndPointHashMap" ::: HashMap.HashMap BaseUrl BaseUrl],
+    HasFlowEnv m r '["ondcTokenHashMap" ::: HashMap.HashMap KeyConfig TokenConfig],
+    HasFlowEnv m r '["nwAddress" ::: BaseUrl],
+    HasFlowEnv m r '["maxNotificationShards" ::: Int],
+    HasField "serviceClickhouseCfg" r ClickhouseCfg,
+    HasField "serviceClickhouseEnv" r ClickhouseEnv,
+    HasField "driverQuoteExpirationSeconds" r NominalDiffTime,
+    HasField "version" r DeploymentVersion,
+    HasFlowEnv m r '["version" ::: DeploymentVersion],
+    HasHttpClientOptions r c,
+    EventStreamFlow m r,
+    HasPrettyLogger m r,
+    ServiceFlow m r,
+    HasField "quoteRespondCoolDown" r Int,
+    HasField "driverUnlockDelay" r Seconds,
+    C.MonadCatch m
+  ) =>
+  DM.Merchant ->
+  DSR.SearchRequest ->
+  DST.SearchTry ->
+  [TripQuoteDetail] ->
+  [DVST.VehicleServiceTier] ->
+  DriverPoolConfig ->
+  PoolBatchNum ->
+  DTC.TransporterConfig ->
+  [DriverPoolWithActualDistResult] ->
+  m [DriverPoolWithActualDistResult]
+attemptPriorityDirectAssign merchant searchReq searchTry tripQuoteDetails cityServiceTiers driverPoolCfg batchNum batchTransporterConfig batch = do
+  -- Renamed to avoid shadowing tryAssign's own local `transporterConfig` param below (a
+  -- same-named param, unlike a do-bind, would be visible to that where-clause).
+  let transporterConfig = batchTransporterConfig
+  let instantAcceptanceConfigForTier tier =
+        DL.find (\vst -> vst.serviceTierType == tier) cityServiceTiers >>= (.instantAcceptanceConfig)
+      isInstantAssignEnabledForTier tier =
+        maybe False (.enabled) (instantAcceptanceConfigForTier tier)
+      -- driverTags is keyed by bare category with the tier name as the value, e.g.
+      -- {"InstantAssign": "COMFY"} -- not a composite "InstantAssign<tier>" key.
+      -- "Cohort" is a separate category, scoped to rider-facing estimate visibility
+      -- (Gate 1/2 + LTS's per-tag GEO bucket) -- it plays no role in this assignment-time check.
+      hasPriorityTag tierName dp = case dp.driverPoolResult.driverTags of
+        Object keymap -> case AKM.lookup (AK.fromString "InstantAssign") keymap of
+          Just (String v) -> v == tierName
+          _ -> False
+        _ -> False
+      -- Checked directly against the typed field carried on DriverPoolResult (populated in
+      -- GetNearestDrivers.hs's mkResultHelper straight from DriverPoolData, no JSON tag
+      -- involved) rather than via a driverTags marker -- avoids the encode/decode mismatch
+      -- class of bug entirely, since a typed field access can't silently fail to match.
+      isPriorityCandidate dp =
+        isInstantAssignEnabledForTier dp.driverPoolResult.serviceTier
+          && hasPriorityTag (show dp.driverPoolResult.serviceTier) dp
+          && dp.driverPoolResult.serviceTier `elem` dp.driverPoolResult.selectedInstantAcceptTiers
+      priorityCandidates = DL.filter isPriorityCandidate batch
+      sortedPriority = DL.sortOn (.actualDistanceToPickup) priorityCandidates
+  if null sortedPriority
+    then pure batch
+    else do
+      let tripQuoteDetailsHashMap = HashMap.fromList $ (\tqd -> (tqd.vehicleServiceTier, tqd)) <$> tripQuoteDetails
+      now <- getCurrentTime
+      let validTill = fromIntegral driverPoolCfg.singleBatchProcessTime `addUTCTime` now
+      quoteRespondCoolDown <- asks (.quoteRespondCoolDown)
+      driverUnlockDelay <- asks (.driverUnlockDelay)
+      assigned <- tryAssign instantAcceptanceConfigForTier transporterConfig tripQuoteDetailsHashMap validTill quoteRespondCoolDown driverUnlockDelay sortedPriority
+      -- On success return [], not the untagged remainder -- the ride's already assigned, so
+      -- broadcasting it would still push a "ride available" notice for a ride already taken.
+      pure $ if assigned then [] else batch
+  where
+    tryAssign ::
+      (ServiceTierType -> Maybe DC.InstantAcceptanceConfig) ->
+      DTC.TransporterConfig ->
+      HashMap.HashMap ServiceTierType TripQuoteDetail ->
+      UTCTime ->
+      Int ->
+      Seconds ->
+      [DriverPoolWithActualDistResult] ->
+      m Bool
+    tryAssign _ _ _ _ _ _ [] = pure False
+    tryAssign instantAcceptanceConfigForTier transporterConfig tripQuoteDetailsHashMap validTill quoteRespondCoolDown driverUnlockDelay (dp : rest) = do
+      let driverId = cast dp.driverPoolResult.driverId
+          unlockThisDriver = Redis.unlockRedis (offerQuoteLockKeyWithCoolDown driverId)
+      locked <- Redis.tryLockRedis (offerQuoteLockKeyWithCoolDown driverId) quoteRespondCoolDown
+      if not locked
+        then tryAssign instantAcceptanceConfigForTier transporterConfig tripQuoteDetailsHashMap validTill quoteRespondCoolDown driverUnlockDelay rest
+        else do
+          result <- C.try $ do
+            driverInfo <- QDI.findById driverId >>= fromMaybeM DriverInfoNotFound
+            -- Same double-booking guard respondQuote has (thereAreActiveQuotes, Driver.hs),
+            -- inlined since that's a private where-closure there. Needed because onRide only
+            -- flips True once initializeRide runs asynchronously -- there's a window after the
+            -- DriverQuote is created where another batch could re-select this same driver.
+            hasActiveQuoteElsewhere <- not . null <$> QDrQt.findActiveQuotesByDriverId driverId driverUnlockDelay
+            -- Re-check live eligibility: `dp`'s active/mode/tiers came from a Redis snapshot
+            -- taken when the batch was built, up to one wave's cadence ago. respondQuote gets
+            -- this for free from the driver's own accept-tap; this silent path has no such
+            -- signal, so it must re-read it.
+            mbVehicle <- QVehicle.findById driverId
+            let stillHasTierSelected = maybe False ((dp.driverPoolResult.serviceTier `elem`) . (.selectedServiceTiers)) mbVehicle
+                stillHasAutoAcceptTierSelected = maybe False ((dp.driverPoolResult.serviceTier `elem`) . fromMaybe [] . (.selectedInstantAcceptTiers)) mbVehicle
+            walletOk <- case instantAcceptanceConfigForTier dp.driverPoolResult.serviceTier >>= (.minWalletBalance) of
+              Nothing -> pure True
+              Just minBalance -> do
+                mbBalance <- SFWallet.getWalletBalanceByOwner SFPrepaid.counterpartyDriver driverId.getId
+                pure $ maybe False (>= minBalance) mbBalance
+            let isStillLive =
+                  not driverInfo.blocked
+                    && driverInfo.enabled
+                    && driverInfo.subscribed
+                    && isDriverModeEligibleHelper driverInfo.mode driverInfo.active
+                    && stillHasTierSelected
+                    && stillHasAutoAcceptTierSelected
+                    && walletOk
+            if driverInfo.onRide || hasActiveQuoteElsewhere || not isStillLive
+              then pure False
+              else do
+                sReqFD <- buildSearchRequestForDriver searchTry searchReq tripQuoteDetailsHashMap batchNum validTill transporterConfig searchReq.riderId Map.empty dp
+                QSRD.createMany [sReqFD]
+                driver <- QPerson.findById driverId >>= fromMaybeM (PersonNotFound driverId.getId)
+                driverStats <- QDriverStats.findById driverId >>= fromMaybeM DriverInfoNotFound
+                void $ acceptDynamicOfferDriverRequest Nothing merchant.id searchReq.merchantOperatingCityId merchant searchTry searchReq driver sReqFD Nothing Nothing Nothing Nothing Nothing Nothing driverStats transporterConfig
+                now <- getCurrentTime
+                QSRD.updateDriverResponse (Just Accept) Inactive Nothing (Just now) (Just now) sReqFD.id
+                pure True
+          case result of
+            Right True -> pure True -- success: lock intentionally stays held, released later by initializeRide, same as the real accept flow
+            Right False -> unlockThisDriver >> tryAssign instantAcceptanceConfigForTier transporterConfig tripQuoteDetailsHashMap validTill quoteRespondCoolDown driverUnlockDelay rest
+            Left (_ :: SomeException) -> unlockThisDriver >> tryAssign instantAcceptanceConfigForTier transporterConfig tripQuoteDetailsHashMap validTill quoteRespondCoolDown driverUnlockDelay rest

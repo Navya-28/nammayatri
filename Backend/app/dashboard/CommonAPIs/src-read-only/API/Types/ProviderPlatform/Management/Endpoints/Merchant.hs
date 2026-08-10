@@ -907,6 +907,7 @@ data VehicleServiceTierConfigCreateReq = VehicleServiceTierConfigCreateReq
     specialZone :: Kernel.Prelude.Maybe Dashboard.Common.SpecialZone,
     cancellationRateConfig :: Kernel.Prelude.Maybe Dashboard.Common.CancellationRateConfig,
     availabilityCheckConfig :: Kernel.Prelude.Maybe Dashboard.Common.AvailabilityCheckConfig,
+    instantAcceptanceConfig :: Kernel.Prelude.Maybe Dashboard.Common.InstantAcceptanceConfig,
     allowNullVehicleRating :: Kernel.Prelude.Maybe Kernel.Prelude.Bool
   }
   deriving stock (Generic)
@@ -946,6 +947,7 @@ data VehicleServiceTierConfigUpdateReq = VehicleServiceTierConfigUpdateReq
     specialZone :: Kernel.Prelude.Maybe Dashboard.Common.SpecialZone,
     cancellationRateConfig :: Kernel.Prelude.Maybe Dashboard.Common.CancellationRateConfig,
     availabilityCheckConfig :: Kernel.Prelude.Maybe Dashboard.Common.AvailabilityCheckConfig,
+    instantAcceptanceConfig :: Kernel.Prelude.Maybe Dashboard.Common.InstantAcceptanceConfig,
     vehicleAgeThreshold :: Kernel.Prelude.Maybe Kernel.Types.Time.Months,
     allowNullVehicleRating :: Kernel.Prelude.Maybe Kernel.Prelude.Bool
   }
@@ -987,6 +989,7 @@ data VehicleServiceTierItem = VehicleServiceTierItem
     specialZone :: Kernel.Prelude.Maybe Dashboard.Common.SpecialZone,
     cancellationRateConfig :: Kernel.Prelude.Maybe Dashboard.Common.CancellationRateConfig,
     availabilityCheckConfig :: Kernel.Prelude.Maybe Dashboard.Common.AvailabilityCheckConfig,
+    instantAcceptanceConfig :: Kernel.Prelude.Maybe Dashboard.Common.InstantAcceptanceConfig,
     allowNullVehicleRating :: Kernel.Prelude.Maybe Kernel.Prelude.Bool
   }
   deriving stock (Generic)

@@ -27,6 +27,7 @@ module Domain.Action.UI.Ride.CancelRide.Internal
   )
 where
 
+import qualified Control.Monad.Catch as C
 import Data.Aeson as A
 import Data.Either.Extra (eitherToMaybe)
 import qualified Data.HashMap.Strict as HM
@@ -53,6 +54,7 @@ import qualified Domain.Types.VehicleVariant as Veh
 import qualified Domain.Types.Yudhishthira as TY
 import EulerHS.Prelude hiding (whenJust)
 import Kernel.External.Maps
+import Kernel.External.Types (ServiceFlow)
 import Kernel.Prelude hiding (any, elem, map, mapM_, notElem)
 import Kernel.Storage.Clickhouse.Config
 import qualified Kernel.Storage.Clickhouse.Config as CH
@@ -61,6 +63,7 @@ import qualified Kernel.Storage.Esqueleto as Esq hiding (whenJust_)
 import Kernel.Storage.Esqueleto.Config (EsqDBReplicaFlow)
 import qualified Kernel.Storage.Hedis as Redis
 import Kernel.Streaming.Kafka.Producer.Types (HasKafkaProducer, KafkaProducerTools)
+import Kernel.Tools.Metrics.CoreMetrics (CoreMetrics, DeploymentVersion)
 import Kernel.Types.Id
 import Kernel.Types.Version (CloudType)
 import Kernel.Utils.Common
@@ -72,6 +75,7 @@ import qualified Lib.DriverScore as DS
 import qualified Lib.DriverScore.Types as DST
 import Lib.Finance (AccountRole (..), EntryStatus (..), FinanceCtx, InvoiceConfig (..), InvoiceLineItem (..), ItemType (..), LineItemDescription (..), createReversal, getEntriesByReference, invoice, runFinance, settleEntry, transfer, transferPending, transferWithoutAttribution, transfer_, voidEntry)
 import qualified Lib.Finance.Core.Types as Finance
+import Lib.Finance.Storage.Beam.BeamFlow (BeamFlow)
 import Lib.Scheduler (SchedulerType)
 import Lib.SessionizerMetrics.Types.Event
 import qualified Lib.Yudhishthira.Tools.DebugLog as LYDL
@@ -91,6 +95,7 @@ import SharedLogic.Ride (releaseLien, updateOnRideStatusWithAdvancedRideCheck)
 import SharedLogic.RuleBasedTierUpgrade
 import qualified SharedLogic.SpecialZoneDriverDemand as SpecialZoneDriverDemand
 import qualified SharedLogic.UserCancellationDues as UserCancellationDues
+import qualified SharedLogic.VehicleServiceTier as SVST
 import qualified Storage.CachedQueries.Driver.GoHomeRequest as CQDGR
 import qualified Storage.CachedQueries.Merchant as CQM
 import qualified Storage.CachedQueries.Merchant.MerchantOperatingCity as CQMOC
@@ -163,7 +168,17 @@ cancelRideImpl ::
     HasField "enableLtsPoolDataForPooling" r Bool,
     Redis.HedisLTSFlowEnv r,
     ClickhouseFlow m r,
-    Finance.HasActorInfo m r
+    Finance.HasActorInfo m r,
+    BeamFlow m r,
+    CoreMetrics m,
+    MonadReader r m,
+    HasField "driverQuoteExpirationSeconds" r NominalDiffTime,
+    HasFlowEnv m r '["version" ::: DeploymentVersion],
+    HasPrettyLogger m r,
+    ServiceFlow m r,
+    HasField "quoteRespondCoolDown" r Int,
+    HasField "driverUnlockDelay" r Seconds,
+    C.MonadCatch m
   ) =>
   Id DRide.Ride ->
   DRide.RideEndedBy ->
@@ -244,6 +259,8 @@ cancelRideImpl rideId rideEndedBy bookingCReason isForceReallocation doCancellat
                 DCP.accumulateCancellationPenalty (fromMaybe False merchant.prepaidSubscriptionAndWalletEnabled || transporterConfig.driverWalletConfig.enableDriverWallet) booking ride rideTags transporterConfig driver
               Notify.notifyOnCancel ride.merchantOperatingCityId ride.id booking driver bookingCReason.source
             fork "cancelRide/ReAllocate - Notify BAP" $ do
+              -- AUTO_ACCEPT bookings are ordinary EstimateBased bookings (broadcast/driver_quote
+              -- pool path), so they reassign through the same path as every other tier.
               isReallocated <- reAllocateBookingIfPossible isValueAddNP False merchant booking ride driver vehicle bookingCReason isForceReallocation
               unless isReallocated $ do
                 -- Reload ride to get persisted cancellationFee/cancellationFeeTax
@@ -258,7 +275,7 @@ cancelRideImpl rideId rideEndedBy bookingCReason isForceReallocation doCancellat
     else throwError (InternalError "Ride is already cancelled")
   where
     buildCancelRideTransactionKey rideId' = "CancelRideTransaction:RID:-" <> rideId'.getId
-    isValidRide ride = ride.status `elem` [DRide.NEW, DRide.UPCOMING]
+    isValidRide r = r.status `elem` [DRide.NEW, DRide.UPCOMING]
 
 cancelRideTransaction ::
   ( EsqDBFlow m r,
@@ -777,7 +794,9 @@ applyCancellationLedgerAction ::
   ( EsqDBFlow m r,
     CacheFlow m r,
     EncFlow m r,
-    Finance.HasActorInfo m r
+    Finance.HasActorInfo m r,
+    Redis.HedisFlow m r,
+    Redis.HedisLTSFlowEnv r
   ) =>
   SRB.Booking ->
   DRide.Ride ->
@@ -904,7 +923,13 @@ applyCancellationLedgerAction booking ride action transporterConfig = do
               }
         case commissionResult of
           Left err -> logError $ "Failed to book cancellation commission for bookingId: " <> refId <> " - " <> show err
-          Right _ -> logInfo $ "Booked cancellation commission for bookingId: " <> refId <> " gross=" <> show cancellationCommissionGross
+          Right _ -> do
+            logInfo $ "Booked cancellation commission for bookingId: " <> refId <> " gross=" <> show cancellationCommissionGross
+            -- §5b of the Auto-Accept design: re-check and auto-disable any wallet-gated tier
+            -- this driver can no longer afford now that the commission has been deducted.
+            fork "walletGatedTierCheck" $
+              SVST.checkAndAutoDisableWalletGatedTiers ride.driverId
+                `C.catchAll` (\e -> logError ("walletGatedTierCheck failed for driverId=" <> ride.driverId.getId <> ": " <> show e))
     UserCancellationDues.OverdueCancellationLedger ->
       unless alreadyOverdue $ do
         entries <- concat <$> mapM (`getEntriesByReference` refId) cancellationLedgerRefs

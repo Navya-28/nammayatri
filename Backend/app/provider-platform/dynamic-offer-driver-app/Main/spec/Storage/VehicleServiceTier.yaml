@@ -12,6 +12,7 @@ imports:
   SpecialZone: Dashboard.Common
   CancellationRateConfig: Dashboard.Common
   AvailabilityCheckConfig: Dashboard.Common
+  InstantAcceptanceConfig: Dashboard.Common
 
 VehicleServiceTier:
   tableName: vehicle_service_tier
@@ -53,6 +54,7 @@ VehicleServiceTier:
     specialZone: Maybe SpecialZone
     cancellationRateConfig: Maybe CancellationRateConfig
     availabilityCheckConfig: Maybe AvailabilityCheckConfig
+    instantAcceptanceConfig: Maybe InstantAcceptanceConfig
   sqlType:
     allowedVehicleVariant: text[]
     defaultForVehicleVariant: text[]
@@ -65,6 +67,7 @@ VehicleServiceTier:
     specialZone: "json"
     cancellationRateConfig: "json"
     availabilityCheckConfig: "json"
+    instantAcceptanceConfig: "json"
   default:
     priority: '0'
     isEnabled: 'true'
@@ -77,6 +80,7 @@ VehicleServiceTier:
     specialZone: Maybe Value
     cancellationRateConfig: Maybe Value
     availabilityCheckConfig: Maybe Value
+    instantAcceptanceConfig: Maybe Value
   fromTType:
     vehicleIconUrl: (Kernel.Prelude.maybe (return Kernel.Prelude.Nothing) (Kernel.Prelude.fmap Kernel.Prelude.Just . parseBaseUrl))|MI
     allowedAreas: (Kernel.Prelude.fmap (Kernel.Prelude.catMaybes . Kernel.Prelude.map Lib.Types.SpecialLocation.parsePickupDropFromText))|I
@@ -86,12 +90,15 @@ VehicleServiceTier:
       (\val -> case Data.Aeson.fromJSON val of Data.Aeson.Success x -> Just x; Data.Aeson.Error _ -> Nothing) =<< cancellationRateConfig|E
     availabilityCheckConfig: |-
       (\val -> case Data.Aeson.fromJSON val of Data.Aeson.Success x -> Just x; Data.Aeson.Error _ -> Nothing) =<< availabilityCheckConfig|E
+    instantAcceptanceConfig: |-
+      (\val -> case Data.Aeson.fromJSON val of Data.Aeson.Success x -> Just x; Data.Aeson.Error _ -> Nothing) =<< instantAcceptanceConfig|E
   toTType:
     vehicleIconUrl: (Kernel.Prelude.fmap showBaseUrl)|I
     allowedAreas: (Kernel.Prelude.fmap (Kernel.Prelude.map Lib.Types.SpecialLocation.areaToText))|I
     specialZone: Kernel.Prelude.toJSON <$> specialZone|E
     cancellationRateConfig: Kernel.Prelude.toJSON <$> cancellationRateConfig|E
     availabilityCheckConfig: Kernel.Prelude.toJSON <$> availabilityCheckConfig|E
+    instantAcceptanceConfig: Kernel.Prelude.toJSON <$> instantAcceptanceConfig|E
   constraints:
     id: PrimaryKey
   queries:

@@ -6,6 +6,7 @@ import qualified AWS.S3 as S3
 import qualified Control.Monad.Catch as C
 import qualified Control.Monad.Extra as CME
 import Crypto.Random (getRandomBytes)
+import qualified Dashboard.Common as DC
 import qualified Data.Aeson as A
 import qualified Data.ByteString.Lazy as BSL
 import qualified Data.List as DL
@@ -69,6 +70,8 @@ import Lib.ConfigPilot.Interface.Types (getConfig, getOneConfig)
 import qualified Lib.Finance.Storage.Queries.IndirectTaxTransaction as QIndirectTax
 import qualified Lib.Finance.Storage.Queries.Invoice as QFinanceInvoice
 import qualified Lib.Queries.SpecialLocation as QSpecialLocation
+import qualified Lib.Yudhishthira.Tools.Utils as Yudhishthira
+import qualified Lib.Yudhishthira.Types as LYT
 import SharedLogic.DriverOnboarding
 import qualified SharedLogic.DriverOnboarding as SDO
 import SharedLogic.DriverOnboarding.Digilocker
@@ -84,6 +87,8 @@ import qualified SharedLogic.DriverOnboarding.Status as SStatus
 import qualified SharedLogic.External.LocationTrackingService.Flow as LTSFlow
 import SharedLogic.FareCalculator
 import SharedLogic.FarePolicy
+import qualified SharedLogic.Finance.Prepaid as SFPrepaid
+import qualified SharedLogic.Finance.Wallet as SFWallet
 import qualified SharedLogic.Merchant as SMerchant
 import qualified SharedLogic.PersonBankAccount as SPBA
 import SharedLogic.VehicleServiceTier
@@ -447,6 +452,9 @@ getDriverVehicleServiceTiers (mbPersonId, _, merchantOpCityId) = do
               isUsageRestricted = Just usageRestricted,
               priority = Just priority,
               airConditioned = airConditionedThreshold,
+              -- Static passthrough of the tier's configured minimum wallet balance (auto-accept
+              -- tiers only) — shown upfront to the driver, not balance-dependent.
+              minWalletBalanceRequired = instantAcceptanceConfig >>= (.minWalletBalance),
               ..
             }
 
@@ -541,10 +549,41 @@ postDriverUpdateServiceTiers (mbPersonId, _, merchantOperatingCityId) API.Types.
           isSelected = maybe isAlreadySelected (.isSelected) mbServiceTierDriverRequest
 
       if not isUsageRestricted && (isSelected || (isDefault && (vehicle.category /= Just DVC.AMBULANCE))) -- Suppressing isDefault check for Ambulance
-        then return $ Just driverServiceTier
+        then do
+          hasSufficientWalletBalance <- checkMinWalletBalance driverServiceTier personId
+          if hasSufficientWalletBalance
+            then return $ Just driverServiceTier
+            else return Nothing
         else return Nothing
   let selectedServiceTierTypes = map (.serviceTierType) $ catMaybes mbSelectedServiceTiers
-  QVehicle.updateSelectedServiceTiers selectedServiceTierTypes personId
+
+  -- Auto-accept opt-in needs the driver's own tags (InstantAssign#<tier>). This duplicates a
+  -- fetch fetchVehicleTierForDriverWithUsageRestriction above already does internally
+  -- (AllowedVariants mode, SharedLogic/VehicleServiceTier.hs), accepted deliberately rather
+  -- than changing that function's signature across its other call sites for one cheap KV
+  -- lookup on this non-hot, driver-initiated endpoint.
+  personForTags <- PersonQuery.findById personId >>= fromMaybeM (PersonNotFound personId.getId)
+  now <- getCurrentTime
+  let hasInstantAssignTag tier =
+        Yudhishthira.elemTagNameValue (LYT.TagNameValue ("InstantAssign#" <> show tier)) (Yudhishthira.filterExpiredTags' now (fromMaybe [] personForTags.driverTag))
+  autoAcceptResults <-
+    fmap catMaybes $
+      forM cityVehicleServiceTiers $ \vst -> case vst.instantAcceptanceConfig of
+        Just cfg | cfg.enabled && hasInstantAssignTag vst.serviceTierType -> do
+          walletOk <- checkMinWalletBalance vst personId
+          pure $
+            if not walletOk
+              then Nothing
+              else case cfg.mode of
+                DC.InstantAcceptOptional | vst.serviceTierType `elem` selectedServiceTierTypes -> Just (vst.serviceTierType, cfg.mode)
+                DC.InstantAcceptOptional -> Nothing
+                DC.InstantAcceptOnly -> Just (vst.serviceTierType, cfg.mode)
+        _ -> pure Nothing
+  let selectedAutoAcceptTierTypes = map fst autoAcceptResults
+      forcedOnlyTiers = [t | (t, DC.InstantAcceptOnly) <- autoAcceptResults]
+      selectedServiceTierTypes' = DL.nub (selectedServiceTierTypes <> forcedOnlyTiers)
+  QVehicle.updateSelectedServiceTiers selectedServiceTierTypes' personId
+  QVehicle.updateSelectedInstantAcceptTiers selectedAutoAcceptTierTypes personId
 
   {- Atleast one intercity/rental/airport non usage restricted service tier should be selected for getting respective rides -}
   let canSwitchToInterCity' =
@@ -575,6 +614,17 @@ postDriverUpdateServiceTiers (mbPersonId, _, merchantOperatingCityId) API.Types.
   QDI.updateAirportSwitch enableForAirport Nothing Nothing personId
 
   return Success
+  where
+    -- Wallet-gated tiers (e.g. AUTO_ACCEPT) require the driver's current wallet balance to
+    -- meet a configured minimum before the toggle is allowed to persist. Tiers with no
+    -- minWalletBalance set (every tier today except wallet-gated ones) are unaffected.
+    checkMinWalletBalance :: VehicleServiceTier -> Kernel.Types.Id.Id Domain.Types.Person.Person -> Environment.Flow Bool
+    checkMinWalletBalance serviceTier driverId =
+      case serviceTier.instantAcceptanceConfig >>= (.minWalletBalance) of
+        Nothing -> pure True
+        Just minBalance -> do
+          mbBalance <- SFWallet.getWalletBalanceByOwner SFPrepaid.counterpartyDriver driverId.getId
+          pure $ maybe False (>= minBalance) mbBalance
 
 postDriverRegisterSsn ::
   ( ( Kernel.Prelude.Maybe (Kernel.Types.Id.Id Domain.Types.Person.Person),

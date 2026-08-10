@@ -431,6 +431,7 @@ makeVehicleFromRC driverId merchantId certificateNumber rc merchantOpCityId now 
       vehicleRatingRemark = rc.vehicleRatingRemark,
       mYManufacturing = rc.mYManufacturing,
       selectedServiceTiers = [],
+      selectedInstantAcceptTiers = Nothing,
       downgradeReason = Nothing,
       createdAt = now,
       updatedAt = now,

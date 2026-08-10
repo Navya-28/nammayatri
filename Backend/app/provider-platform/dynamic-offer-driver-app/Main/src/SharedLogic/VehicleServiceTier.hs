@@ -14,8 +14,10 @@
 
 module SharedLogic.VehicleServiceTier where
 
+import qualified Dashboard.Common as DC
 import qualified Data.HashMap.Strict as HashMap
 import Data.List (sortOn)
+import qualified Data.List as DL
 import Data.Ord (Down (..))
 import Data.Time (diffDays, utctDay)
 import qualified Domain.Types.Common as DTC
@@ -32,9 +34,12 @@ import Kernel.Prelude
 import qualified Kernel.Storage.Hedis as Redis
 import Kernel.Types.Id
 import Kernel.Utils.Common
+import Lib.Finance.Storage.Beam.BeamFlow (BeamFlow)
 import qualified Lib.Yudhishthira.Types as LYT
 import qualified SharedLogic.DriverPool.DriverPoolData as DPD
 import qualified SharedLogic.DriverPool.LTSDataSync as LTSSync
+import qualified SharedLogic.Finance.Prepaid as SFPrepaid
+import qualified SharedLogic.Finance.Wallet as SFWallet
 import qualified Storage.CachedQueries.VehicleServiceTier as CQVST
 import qualified Storage.Queries.DriverInformation as QDI
 import qualified Storage.Queries.DriverStats as QDriverStats
@@ -231,3 +236,67 @@ backfillSelectedServiceTiers inputTiers vehicle driverInfo transporterConfig mer
         logInfo $ "backfillSelectedServiceTiers: LTS selectedServiceTiers empty for driver " <> vehicle.driverId.getId <> ", pushing DB tiers"
         LTSSync.syncDriverPoolDataToLTS driverId $
           LTSSync.emptyUpdate {LTSSync.selectedServiceTiers = LTSSync.Set inputTiers}
+
+-- | Re-validates every auto-accept-eligible tier a driver currently holds (in
+-- selectedServiceTiers or selectedInstantAcceptTiers) against their live wallet balance,
+-- dropping any that now fall short. Toggle-on time alone can't guarantee a driver stays
+-- funded -- the wallet is shared with other debits (cancellation penalties, airport fees,
+-- refunds, admin adjustments). Called directly from each known driver-app function that can
+-- decrease a driver's wallet balance, rather than via a generic finance-kernel hook. This is
+-- an enumerable, not structural, list -- a future debit mechanism must remember to call this
+-- too. Generic across any tier with instantAcceptanceConfig, not just AUTO_ACCEPT.
+-- | Both this function and dropServiceTierFromSelection below read then overwrite
+-- selectedServiceTiers/selectedInstantAcceptTiers. They can run concurrently for the same driver
+-- off the same event (e.g. a single cancellation forks both a wallet-gated-tier check and a
+-- cancellation-consequence drop), so without serializing them one can silently undo the
+-- other's removal (whichever writes last wins, from a stale read). Both share this one lock
+-- key for exactly that reason.
+selectedServiceTiersLockKey :: Id DP.Person -> Text
+selectedServiceTiersLockKey driverId = "Driver:SelectedServiceTiers:DId-" <> driverId.getId
+
+checkAndAutoDisableWalletGatedTiers :: (MonadFlow m, EsqDBFlow m r, CacheFlow m r, BeamFlow m r, Redis.HedisFlow m r, Redis.HedisLTSFlowEnv r) => Id DP.Person -> m ()
+checkAndAutoDisableWalletGatedTiers driverId =
+  Redis.withWaitOnLockRedisWithExpiry (selectedServiceTiersLockKey driverId) 5 10 $ do
+    mbVehicle <- QVehicle.findById driverId
+    whenJust mbVehicle $ \vehicle ->
+      whenJust vehicle.merchantOperatingCityId $ \merchantOpCityId -> do
+        let selectedInstantAcceptTiers = fromMaybe [] vehicle.selectedInstantAcceptTiers
+            tiersToCheck = DL.nub (vehicle.selectedServiceTiers <> selectedInstantAcceptTiers)
+        unless (null tiersToCheck) $ do
+          failing <-
+            fmap catMaybes $
+              forM tiersToCheck $ \tierType -> do
+                mbTier <- CQVST.findByServiceTierTypeAndCityId tierType merchantOpCityId Nothing
+                case mbTier >>= (.instantAcceptanceConfig) of
+                  Nothing -> pure Nothing
+                  Just cfg -> case cfg.minWalletBalance of
+                    Nothing -> pure Nothing
+                    Just minBalance -> do
+                      mbBalance <- SFWallet.getWalletBalanceByOwner SFPrepaid.counterpartyDriver driverId.getId
+                      pure $ if maybe True (< minBalance) mbBalance then Just (tierType, cfg.mode) else Nothing
+          unless (null failing) $ do
+            let onlyModeFailing = [t | (t, DC.InstantAcceptOnly) <- failing]
+                allFailingTiers = map fst failing
+            QVehicle.updateSelectedServiceTiers (filter (`notElem` onlyModeFailing) vehicle.selectedServiceTiers) driverId
+            QVehicle.updateSelectedInstantAcceptTiers (filter (`notElem` allFailingTiers) selectedInstantAcceptTiers) driverId
+
+-- | Drops one tier from a driver's auto-accept eligibility, if present. Distinct from
+-- checkAndAutoDisableWalletGatedTiers above -- this isn't about wallet balance. It's a
+-- cancellation consequence: a driver-initiated cancellation the city's rule engine already
+-- flags validCancellationPenaltyApplicable costs the tier's priority status, since an
+-- auto-accepted ride has no accept step to decline through. InstantAcceptOnly mode also drops
+-- the tier from selectedServiceTiers entirely (no other way to be eligible for it);
+-- InstantAcceptOptional mode only drops selectedInstantAcceptTiers, leaving ordinary tier
+-- eligibility untouched. Re-enabling is a plain manual re-toggle through the existing flow
+-- (still subject to the usual wallet-balance gate) -- deliberately no cooldown, no extra
+-- state.
+dropServiceTierFromSelection :: (MonadFlow m, EsqDBFlow m r, CacheFlow m r, Redis.HedisFlow m r, Redis.HedisLTSFlowEnv r) => DC.InstantAcceptanceMode -> DTC.ServiceTierType -> Id DP.Person -> m ()
+dropServiceTierFromSelection mode tierType driverId =
+  Redis.withWaitOnLockRedisWithExpiry (selectedServiceTiersLockKey driverId) 5 10 $ do
+    mbVehicle <- QVehicle.findById driverId
+    whenJust mbVehicle $ \vehicle -> do
+      when (mode == DC.InstantAcceptOnly && tierType `elem` vehicle.selectedServiceTiers) $
+        QVehicle.updateSelectedServiceTiers (filter (/= tierType) vehicle.selectedServiceTiers) driverId
+      let selectedInstantAcceptTiers = fromMaybe [] vehicle.selectedInstantAcceptTiers
+      when (tierType `elem` selectedInstantAcceptTiers) $
+        QVehicle.updateSelectedInstantAcceptTiers (filter (/= tierType) selectedInstantAcceptTiers) driverId

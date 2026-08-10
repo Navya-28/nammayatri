@@ -43,7 +43,7 @@ import Domain.Types.VehicleCategory
 import Domain.Types.VehicleVariant
 import Kernel.Prelude
 import Kernel.ServantMultipart
-import Kernel.Types.Common (Centesimal, Meters)
+import Kernel.Types.Common (Centesimal, HighPrecMoney, Meters)
 import Kernel.Types.HideSecrets
 import Kernel.Types.HideSecrets as Reexport
 import qualified Kernel.Types.Id as Id
@@ -411,5 +411,22 @@ data CancellationRateConfig = CancellationRateConfig
 data AvailabilityCheckConfig = AvailabilityCheckConfig
   { radiusMeters :: Meters,
     minDriverCount :: Int
+  }
+  deriving (Generic, Show, Eq, ToJSON, FromJSON, ToSchema)
+
+-- | Enables system-side (silent, no accept-tap) assignment for a tier. `InstantAcceptOnly`
+-- tiers have no non-priority mode -- a driver becomes eligible for the tier itself only
+-- via this mechanism, and losing eligibility drops the tier entirely. `InstantAcceptOptional`
+-- tiers work normally without priority too; losing eligibility only loses priority
+-- treatment. Sole source of truth for the wallet-balance gate on the instant-accept path --
+-- AvailabilityCheckConfig no longer carries a wallet field, that's a separate concern
+-- (rider-facing estimate-visibility quorum).
+data InstantAcceptanceMode = InstantAcceptOnly | InstantAcceptOptional
+  deriving (Generic, Show, Eq, ToJSON, FromJSON, ToSchema)
+
+data InstantAcceptanceConfig = InstantAcceptanceConfig
+  { minWalletBalance :: Maybe HighPrecMoney,
+    mode :: InstantAcceptanceMode,
+    enabled :: Bool
   }
   deriving (Generic, Show, Eq, ToJSON, FromJSON, ToSchema)

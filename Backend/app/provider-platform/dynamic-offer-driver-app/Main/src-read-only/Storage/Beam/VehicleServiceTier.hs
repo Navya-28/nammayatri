@@ -29,6 +29,7 @@ data VehicleServiceTierT f = VehicleServiceTierT
     driverRating :: (B.C f (Kernel.Prelude.Maybe Kernel.Types.Common.Centesimal)),
     fareAdditionPerKmOverBaseServiceTier :: (B.C f (Kernel.Prelude.Maybe Kernel.Prelude.Int)),
     id :: (B.C f Kernel.Prelude.Text),
+    instantAcceptanceConfig :: (B.C f (Kernel.Prelude.Maybe Data.Aeson.Value)),
     isAirConditioned :: (B.C f (Kernel.Prelude.Maybe Kernel.Prelude.Bool)),
     isEnabled :: (B.C f (Kernel.Prelude.Maybe Kernel.Prelude.Bool)),
     isIntercityEnabled :: (B.C f (Kernel.Prelude.Maybe Kernel.Prelude.Bool)),

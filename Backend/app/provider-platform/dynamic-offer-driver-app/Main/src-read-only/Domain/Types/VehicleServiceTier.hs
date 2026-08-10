@@ -30,6 +30,7 @@ data VehicleServiceTier = VehicleServiceTier
     driverRating :: Kernel.Prelude.Maybe Kernel.Types.Common.Centesimal,
     fareAdditionPerKmOverBaseServiceTier :: Kernel.Prelude.Maybe Kernel.Prelude.Int,
     id :: Kernel.Types.Id.Id Domain.Types.VehicleServiceTier.VehicleServiceTier,
+    instantAcceptanceConfig :: Kernel.Prelude.Maybe Dashboard.Common.InstantAcceptanceConfig,
     isAirConditioned :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
     isEnabled :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
     isIntercityEnabled :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,

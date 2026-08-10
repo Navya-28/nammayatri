@@ -14,6 +14,7 @@
 
 module SharedLogic.Allocator.Jobs.SendSearchRequestToDrivers.Handle.Internal.SendSearchRequestToDrivers
   ( sendSearchRequestToDrivers,
+    buildSearchRequestForDriver,
   )
 where
 
@@ -157,7 +158,7 @@ sendSearchRequestToDrivers isAllocatorBatch tripQuoteDetails oldSearchReq search
       else return M.empty
 
   transporterConfig <- getOneConfig (TransporterConfigDimensions {merchantOperatingCityId = searchReq.merchantOperatingCityId.getId}) Nothing >>= fromMaybeM (TransporterConfigNotFound searchReq.merchantOperatingCityId.getId)
-  searchRequestsForDrivers <- mapM (buildSearchRequestForDriver searchReq tripQuoteDetailsHashMap batchNumber validTill transporterConfig searchReq.riderId coinConfigCache) driverPool
+  searchRequestsForDrivers <- mapM (buildSearchRequestForDriver searchTry searchReq tripQuoteDetailsHashMap batchNumber validTill transporterConfig searchReq.riderId coinConfigCache) driverPool
   let driverPoolZipSearchRequests = zip driverPool searchRequestsForDrivers
   -- Handle queue skip for timed-out special zone drivers before marking them inactive.
   -- Forked because it's independent of the search-batch flow — failures must not
@@ -198,214 +199,223 @@ sendSearchRequestToDrivers isAllocatorBatch tripQuoteDetails oldSearchReq search
     let allDriverIds = map (.driverId) searchRequestsForDrivers
     Analytics.updateOperatorAnalyticsTotalRequestCountBatch allDriverIds transporterConfig
   where
-    getBaseFare ::
-      ( MonadFlow m,
-        Redis.HedisFlow m r,
-        HasFlowEnv m r '["version" ::: DeploymentVersion],
-        EsqDBFlow m r,
-        Esq.EsqDBReplicaFlow m r,
-        CacheFlow m r
-      ) =>
-      DSR.SearchRequest ->
-      DFP.FullFarePolicy ->
-      Maybe Months ->
-      SDP.TripQuoteDetail ->
-      DTR.TransporterConfig ->
-      m HighPrecMoney
-    getBaseFare searchReq farePolicy vehicleAge tripQuoteDetail transporterConfig = do
-      mbDomainDiscountPct <- CQDDC.resolveDomainDiscountPercentage searchReq.merchantOperatingCityId searchTry.emailDomain searchTry.businessEmailDomain searchTry.billingCategory farePolicy.vehicleServiceTier
-      let farePolicy' =
-            farePolicy
-              { DFP.businessDiscountPercentage = mbDomainDiscountPct <|> farePolicy.businessDiscountPercentage,
-                DFP.personalDiscountPercentage = mbDomainDiscountPct <|> farePolicy.personalDiscountPercentage
-              } ::
-              DFP.FullFarePolicy
-      fareParams <-
-        Fare.calculateFareParameters
-          Fare.CalculateFareParametersParams
-            { farePolicy = farePolicy',
-              actualDistance = searchReq.estimatedDistance,
-              estimatedDistance = searchReq.estimatedDistance,
-              rideTime = searchReq.startTime,
-              returnTime = searchReq.returnTime,
-              roundTrip = fromMaybe False searchReq.roundTrip,
-              waitingTime = Nothing,
-              stopWaitingTimes = [],
-              actualRideDuration = Nothing,
-              petCharges = tripQuoteDetail.petCharges,
-              shouldApplyBusinessDiscount = searchTry.billingCategory == SLT.BUSINESS,
-              shouldApplyPersonalDiscount = searchTry.billingCategory == SLT.PERSONAL,
-              noOfStops = length searchReq.stops,
-              estimatedRideDuration = searchReq.estimatedDuration,
-              estimatedCongestionCharge = Nothing,
-              driverSelectedFare = Nothing,
-              customerExtraFee = Nothing,
-              nightShiftCharge = Nothing,
-              customerCancellationDues = searchReq.customerCancellationDues,
-              nightShiftOverlapChecking = DTC.isFixedNightCharge tripQuoteDetail.tripCategory,
-              timeDiffFromUtc = Just transporterConfig.timeDiffFromUtc,
-              tollCharges = Nothing,
-              vehicleAge = vehicleAge,
-              currency = searchReq.currency,
-              distanceUnit = searchReq.distanceUnit,
-              merchantOperatingCityId = Just searchReq.merchantOperatingCityId,
-              mbAdditonalChargeCategories = Nothing,
-              numberOfLuggages = searchReq.numberOfLuggages,
-              govtChargesRate = Just transporterConfig.taxConfig.rideGst,
-              pickupGateId = searchReq.pickupGateId
-            }
-      pure $ Fare.fareSum fareParams $ Just []
-
     getSearchRequestValidTill = do
       now <- getCurrentTime
       let singleBatchProcessTime = fromIntegral driverPoolConfig.singleBatchProcessTime
       return $ singleBatchProcessTime `addUTCTime` now
-    buildSearchRequestForDriver ::
-      ( MonadFlow m,
-        Redis.HedisFlow m r,
-        HasFlowEnv m r '["version" ::: DeploymentVersion],
-        EsqDBFlow m r,
-        Esq.EsqDBReplicaFlow m r,
-        CacheFlow m r,
-        HasFlowEnv m r '["mlPricingInternal" ::: ML.MLPricingInternal],
-        HasFlowEnv m r '["internalEndPointHashMap" ::: HM.HashMap BaseUrl BaseUrl],
-        HasField "serviceClickhouseCfg" r CH.ClickhouseCfg,
-        HasField "serviceClickhouseEnv" r CH.ClickhouseEnv,
-        ClickhouseFlow m r
-      ) =>
-      DSR.SearchRequest ->
-      HashMap.HashMap DVST.ServiceTierType SDP.TripQuoteDetail ->
-      Int ->
-      UTCTime ->
-      DTR.TransporterConfig ->
-      Maybe (Id RiderDetails) ->
-      M.Map DVST.ServiceTierType (Maybe Int) ->
-      SDP.DriverPoolWithActualDistResult ->
-      m SearchRequestForDriver
-    buildSearchRequestForDriver searchReq tripQuoteDetailsHashMap batchNumber defaultValidTill transporterConfig riderId coinConfigCache dpwRes = do
-      let currency = searchTry.currency
-      guid <- generateGUID
-      now <- getCurrentTime
-      let dpRes = dpwRes.driverPoolResult
-      driverStats <- runInReplica $ QDriverStats.findById dpRes.driverId
-      driverPlanSafetyPlus <- QDP.findByDriverIdWithServiceName dpwRes.driverPoolResult.driverId (DPlan.DASHCAM_RENTAL DPlan.CAUTIO)
-      tripQuoteDetail <- HashMap.lookup dpRes.serviceTier tripQuoteDetailsHashMap & fromMaybeM (VehicleServiceTierNotFound $ show dpRes.serviceTier)
-      let isEligibleForSafetyPlusCharge = maybe False (.enableServiceUsageCharge) driverPlanSafetyPlus && searchReq.preferSafetyPlus
-          additionalChargesEligiblFor = additionalChargeConditional isEligibleForSafetyPlusCharge tripQuoteDetail.conditionalCharges
-          additionalCharges = sum $ map (\ac -> if ac.chargeCategory `elem` additionalChargesEligiblFor then ac.charge else 0.0) tripQuoteDetail.conditionalCharges
-      parallelSearchRequestCount <- Just <$> SDP.getValidSearchRequestCount searchReq.providerId dpRes.driverId now
-
-      let driverCoinsRewardedOnGoldTierRideRequest = join $ M.lookup dpRes.serviceTier coinConfigCache
-
-      logInfo $ "Coins rewarded on gold tier ride request: " <> show driverCoinsRewardedOnGoldTierRideRequest
-
-      baseFare <- case tripQuoteDetail.tripCategory of
-        DTC.Ambulance _ -> do
-          farePolicy <- getFarePolicyByEstOrQuoteId (Just $ EMaps.getCoordinates searchReq.fromLocation) (Just . EMaps.getCoordinates =<< searchReq.toLocation) searchReq.fromLocGeohash searchReq.toLocGeohash searchReq.estimatedDistance searchReq.estimatedDuration searchReq.merchantOperatingCityId tripQuoteDetail.tripCategory dpRes.serviceTier searchReq.area searchTry.estimateId Nothing Nothing searchReq.dynamicPricingLogicVersion (Just (TransactionId (Id searchReq.transactionId))) searchReq.configInExperimentVersions searchReq.specialLocationName
-          getBaseFare searchReq farePolicy dpRes.vehicleAge tripQuoteDetail transporterConfig
-        _ -> pure $ tripQuoteDetail.baseFare + additionalCharges
-      deploymentVersion <- asks (.version)
-      isFavourite <- maybe (pure Nothing) (\riderid -> findByRiderIdAndDriverId riderid (cast dpRes.driverId) <&> fmap (.favourite)) riderId
-      let searchRequestForDriver =
-            SearchRequestForDriver
-              { id = guid,
-                requestId = searchReq.id,
-                searchTryId = searchTry.id,
-                vehicleCategory = searchTry.vehicleCategory,
-                estimateId = Just tripQuoteDetail.estimateOrQuoteId,
-                startTime = searchTry.startTime,
-                merchantId = Just searchReq.providerId,
-                fromLocGeohash = searchReq.fromLocGeohash,
-                tripEstimatedDistance = searchReq.estimatedDistance,
-                tripEstimatedDuration = searchReq.estimatedDuration,
-                vehicleAge = dpRes.vehicleAge,
-                merchantOperatingCityId = searchReq.merchantOperatingCityId,
-                searchRequestValidTill = if dpwRes.pickupZone then addUTCTime (fromIntegral dpwRes.keepHiddenForSeconds) defaultValidTill else defaultValidTill,
-                driverId = cast dpRes.driverId,
-                fleetOwnerId = Id <$> dpRes.fleetOwnerId,
-                vehicleNumber = dpRes.vehicleNumber,
-                vehicleVariant = dpRes.variant,
-                vehicleServiceTier = tripQuoteDetail.vehicleServiceTier,
-                vehicleServiceTierName = Just tripQuoteDetail.vehicleServiceTierName,
-                airConditioned = dpRes.isAirConditioned,
-                actualDistanceToPickup = dpwRes.actualDistanceToPickup,
-                straightLineDistanceToPickup = dpRes.distanceToPickup,
-                durationToPickup = dpwRes.actualDurationToPickup,
-                status = Active,
-                lat = Just dpRes.lat,
-                lon = Just dpRes.lon,
-                createdAt = now,
-                updatedAt = Just now,
-                response = Nothing,
-                driverMinExtraFee = tripQuoteDetail.driverMinFee,
-                driverMaxExtraFee = tripQuoteDetail.driverMaxFee,
-                driverStepFee = tripQuoteDetail.driverStepFee,
-                driverDefaultStepFee = tripQuoteDetail.driverDefaultStepFee,
-                rideRequestPopupDelayDuration = dpwRes.intelligentScores.rideRequestPopupDelayDuration,
-                baseFare = Just baseFare,
-                currency,
-                distanceUnit = searchReq.distanceUnit,
-                isPartOfIntelligentPool = dpwRes.isPartOfIntelligentPool,
-                acceptanceRatio = dpwRes.intelligentScores.acceptanceRatio,
-                cancellationRatio = dpwRes.intelligentScores.cancellationRatio,
-                driverAvailableTime = dpwRes.intelligentScores.availableTime,
-                driverSpeed = dpwRes.intelligentScores.driverSpeed,
-                keepHiddenForSeconds = dpwRes.keepHiddenForSeconds,
-                pickupZone = dpwRes.pickupZone,
-                mode = dpRes.mode,
-                goHomeRequestId = dpwRes.goHomeReqId,
-                rideFrequencyScore = dpwRes.intelligentScores.rideFrequency,
-                customerCancellationDues = fromMaybe 0 searchReq.customerCancellationDues,
-                clientSdkVersion = dpwRes.driverPoolResult.clientSdkVersion,
-                reactBundleVersion = dpwRes.driverPoolResult.reactBundleVersion,
-                clientBundleVersion = dpwRes.driverPoolResult.clientBundleVersion,
-                clientConfigVersion = dpwRes.driverPoolResult.clientConfigVersion,
-                clientDevice = dpwRes.driverPoolResult.clientDevice,
-                backendConfigVersion = dpwRes.driverPoolResult.backendConfigVersion,
-                backendAppVersion = Just deploymentVersion.getDeploymentVersion,
-                isForwardRequest = dpwRes.isForwardRequest,
-                previousDropGeoHash = dpwRes.previousDropGeoHash,
-                driverTags = Just $ addSpecialLocWarriorPreferredSpecialLocId dpwRes.specialLocWarriorPreferredSpecialLocId dpRes.driverTags,
-                customerTags = dpRes.customerTags,
-                poolingLogicVersion = searchReq.poolingLogicVersion,
-                poolingConfigVersion = searchReq.poolingConfigVersion,
-                notificationSource = Nothing,
-                totalRides = fromMaybe (-1) (driverStats <&> (.totalRides)),
-                renderedAt = Nothing,
-                respondedAt = Nothing,
-                middleStopCount = Just $ length searchReq.stops,
-                upgradeCabRequest = Just tripQuoteDetail.eligibleForUpgrade,
-                isFavourite = isFavourite,
-                parcelType = searchReq.parcelType,
-                parcelQuantity = searchReq.parcelQuantity,
-                driverTagScore = dpwRes.score,
-                conditionalCharges = additionalChargesEligiblFor,
-                isSafetyPlus = Just isEligibleForSafetyPlusCharge,
-                coinsRewardedOnGoldTierRide = driverCoinsRewardedOnGoldTierRideRequest,
-                commissionCharges = tripQuoteDetail.commissionCharges,
-                ..
-              }
-      pure searchRequestForDriver
-      where
-        addSpecialLocWarriorPreferredSpecialLocId mbSpecialLocId driverTags =
-          case mbSpecialLocId of
-            Nothing -> driverTags
-            Just specialLocId ->
-              let tagKey = AK.fromString "SpecialLocWarriorPreferredSpecialLoc"
-                  tagValue = String specialLocId.getId
-               in case driverTags of
-                    Object keymap -> Object $ AKM.insert tagKey tagValue keymap
-                    _ -> Object $ AKM.singleton tagKey tagValue
-
-        additionalChargeConditional isEligibleForSafetyPlusCharge conditionalCharges = do
-          let safetyCharges = if isEligibleForSafetyPlusCharge then find (\ac -> ac == DAC.SAFETY_PLUS_CHARGES) $ map (.chargeCategory) conditionalCharges else Nothing
-          catMaybes $ [safetyCharges]
 
     isContainsGoldTierTag :: Maybe [Lib.Yudhishthira.Types.TagNameValue] -> Bool
     isContainsGoldTierTag customerNammaTags =
       case customerNammaTags of
         Just tags -> any (\tag -> tag == TagNameValue "CustomerTier#Gold") tags
         Nothing -> False
+
+getBaseFare ::
+  ( MonadFlow m,
+    Redis.HedisFlow m r,
+    HasFlowEnv m r '["version" ::: DeploymentVersion],
+    EsqDBFlow m r,
+    Esq.EsqDBReplicaFlow m r,
+    CacheFlow m r
+  ) =>
+  DST.SearchTry ->
+  DSR.SearchRequest ->
+  DFP.FullFarePolicy ->
+  Maybe Months ->
+  SDP.TripQuoteDetail ->
+  DTR.TransporterConfig ->
+  m HighPrecMoney
+getBaseFare searchTry searchReq farePolicy vehicleAge tripQuoteDetail transporterConfig = do
+  mbDomainDiscountPct <- CQDDC.resolveDomainDiscountPercentage searchReq.merchantOperatingCityId searchTry.emailDomain searchTry.businessEmailDomain searchTry.billingCategory farePolicy.vehicleServiceTier
+  let farePolicy' =
+        farePolicy
+          { DFP.businessDiscountPercentage = mbDomainDiscountPct <|> farePolicy.businessDiscountPercentage,
+            DFP.personalDiscountPercentage = mbDomainDiscountPct <|> farePolicy.personalDiscountPercentage
+          } ::
+          DFP.FullFarePolicy
+  fareParams <-
+    Fare.calculateFareParameters
+      Fare.CalculateFareParametersParams
+        { farePolicy = farePolicy',
+          actualDistance = searchReq.estimatedDistance,
+          estimatedDistance = searchReq.estimatedDistance,
+          rideTime = searchReq.startTime,
+          returnTime = searchReq.returnTime,
+          roundTrip = fromMaybe False searchReq.roundTrip,
+          waitingTime = Nothing,
+          stopWaitingTimes = [],
+          actualRideDuration = Nothing,
+          petCharges = tripQuoteDetail.petCharges,
+          shouldApplyBusinessDiscount = searchTry.billingCategory == SLT.BUSINESS,
+          shouldApplyPersonalDiscount = searchTry.billingCategory == SLT.PERSONAL,
+          noOfStops = length searchReq.stops,
+          estimatedRideDuration = searchReq.estimatedDuration,
+          estimatedCongestionCharge = Nothing,
+          driverSelectedFare = Nothing,
+          customerExtraFee = Nothing,
+          nightShiftCharge = Nothing,
+          customerCancellationDues = searchReq.customerCancellationDues,
+          nightShiftOverlapChecking = DTC.isFixedNightCharge tripQuoteDetail.tripCategory,
+          timeDiffFromUtc = Just transporterConfig.timeDiffFromUtc,
+          tollCharges = Nothing,
+          vehicleAge = vehicleAge,
+          currency = searchReq.currency,
+          distanceUnit = searchReq.distanceUnit,
+          merchantOperatingCityId = Just searchReq.merchantOperatingCityId,
+          mbAdditonalChargeCategories = Nothing,
+          numberOfLuggages = searchReq.numberOfLuggages,
+          govtChargesRate = Just transporterConfig.taxConfig.rideGst,
+          pickupGateId = searchReq.pickupGateId
+        }
+  pure $ Fare.fareSum fareParams $ Just []
+
+-- | Extracted from sendSearchRequestToDrivers' where-clause (searchTry threaded explicitly
+-- instead of closed over) so the new unified-instant-assign-pool mechanism
+-- (SharedLogic.Allocator.Jobs.SendSearchRequestToDrivers.Handle.Internal.DriverPoolUnified) can
+-- build the same SearchRequestForDriver row for a priority-picked driver without duplicating
+-- this fare/tag logic, before immediately replaying acceptDynamicOfferDriverRequest on it
+-- instead of broadcasting a notification for it.
+buildSearchRequestForDriver ::
+  ( MonadFlow m,
+    Redis.HedisFlow m r,
+    HasFlowEnv m r '["version" ::: DeploymentVersion],
+    EsqDBFlow m r,
+    Esq.EsqDBReplicaFlow m r,
+    CacheFlow m r,
+    HasFlowEnv m r '["mlPricingInternal" ::: ML.MLPricingInternal],
+    HasFlowEnv m r '["internalEndPointHashMap" ::: HM.HashMap BaseUrl BaseUrl],
+    HasField "serviceClickhouseCfg" r CH.ClickhouseCfg,
+    HasField "serviceClickhouseEnv" r CH.ClickhouseEnv,
+    ClickhouseFlow m r
+  ) =>
+  DST.SearchTry ->
+  DSR.SearchRequest ->
+  HashMap.HashMap DVST.ServiceTierType SDP.TripQuoteDetail ->
+  Int ->
+  UTCTime ->
+  DTR.TransporterConfig ->
+  Maybe (Id RiderDetails) ->
+  M.Map DVST.ServiceTierType (Maybe Int) ->
+  SDP.DriverPoolWithActualDistResult ->
+  m SearchRequestForDriver
+buildSearchRequestForDriver searchTry searchReq tripQuoteDetailsHashMap batchNumber defaultValidTill transporterConfig riderId coinConfigCache dpwRes = do
+  let currency = searchTry.currency
+  guid <- generateGUID
+  now <- getCurrentTime
+  let dpRes = dpwRes.driverPoolResult
+  driverStats <- runInReplica $ QDriverStats.findById dpRes.driverId
+  driverPlanSafetyPlus <- QDP.findByDriverIdWithServiceName dpwRes.driverPoolResult.driverId (DPlan.DASHCAM_RENTAL DPlan.CAUTIO)
+  tripQuoteDetail <- HashMap.lookup dpRes.serviceTier tripQuoteDetailsHashMap & fromMaybeM (VehicleServiceTierNotFound $ show dpRes.serviceTier)
+  let isEligibleForSafetyPlusCharge = maybe False (.enableServiceUsageCharge) driverPlanSafetyPlus && searchReq.preferSafetyPlus
+      additionalChargesEligiblFor = additionalChargeConditional isEligibleForSafetyPlusCharge tripQuoteDetail.conditionalCharges
+      additionalCharges = sum $ map (\ac -> if ac.chargeCategory `elem` additionalChargesEligiblFor then ac.charge else 0.0) tripQuoteDetail.conditionalCharges
+  parallelSearchRequestCount <- Just <$> SDP.getValidSearchRequestCount searchReq.providerId dpRes.driverId now
+
+  let driverCoinsRewardedOnGoldTierRideRequest = join $ M.lookup dpRes.serviceTier coinConfigCache
+
+  logInfo $ "Coins rewarded on gold tier ride request: " <> show driverCoinsRewardedOnGoldTierRideRequest
+
+  baseFare <- case tripQuoteDetail.tripCategory of
+    DTC.Ambulance _ -> do
+      farePolicy <- getFarePolicyByEstOrQuoteId (Just $ EMaps.getCoordinates searchReq.fromLocation) (Just . EMaps.getCoordinates =<< searchReq.toLocation) searchReq.fromLocGeohash searchReq.toLocGeohash searchReq.estimatedDistance searchReq.estimatedDuration searchReq.merchantOperatingCityId tripQuoteDetail.tripCategory dpRes.serviceTier searchReq.area searchTry.estimateId Nothing Nothing searchReq.dynamicPricingLogicVersion (Just (TransactionId (Id searchReq.transactionId))) searchReq.configInExperimentVersions searchReq.specialLocationName
+      getBaseFare searchTry searchReq farePolicy dpRes.vehicleAge tripQuoteDetail transporterConfig
+    _ -> pure $ tripQuoteDetail.baseFare + additionalCharges
+  deploymentVersion <- asks (.version)
+  isFavourite <- maybe (pure Nothing) (\riderid -> findByRiderIdAndDriverId riderid (cast dpRes.driverId) <&> fmap (.favourite)) riderId
+  let searchRequestForDriver =
+        SearchRequestForDriver
+          { id = guid,
+            requestId = searchReq.id,
+            searchTryId = searchTry.id,
+            vehicleCategory = searchTry.vehicleCategory,
+            estimateId = Just tripQuoteDetail.estimateOrQuoteId,
+            startTime = searchTry.startTime,
+            merchantId = Just searchReq.providerId,
+            fromLocGeohash = searchReq.fromLocGeohash,
+            tripEstimatedDistance = searchReq.estimatedDistance,
+            tripEstimatedDuration = searchReq.estimatedDuration,
+            vehicleAge = dpRes.vehicleAge,
+            merchantOperatingCityId = searchReq.merchantOperatingCityId,
+            searchRequestValidTill = if dpwRes.pickupZone then addUTCTime (fromIntegral dpwRes.keepHiddenForSeconds) defaultValidTill else defaultValidTill,
+            driverId = cast dpRes.driverId,
+            fleetOwnerId = Id <$> dpRes.fleetOwnerId,
+            vehicleNumber = dpRes.vehicleNumber,
+            vehicleVariant = dpRes.variant,
+            vehicleServiceTier = tripQuoteDetail.vehicleServiceTier,
+            vehicleServiceTierName = Just tripQuoteDetail.vehicleServiceTierName,
+            airConditioned = dpRes.isAirConditioned,
+            actualDistanceToPickup = dpwRes.actualDistanceToPickup,
+            straightLineDistanceToPickup = dpRes.distanceToPickup,
+            durationToPickup = dpwRes.actualDurationToPickup,
+            status = Active,
+            lat = Just dpRes.lat,
+            lon = Just dpRes.lon,
+            createdAt = now,
+            updatedAt = Just now,
+            response = Nothing,
+            driverMinExtraFee = tripQuoteDetail.driverMinFee,
+            driverMaxExtraFee = tripQuoteDetail.driverMaxFee,
+            driverStepFee = tripQuoteDetail.driverStepFee,
+            driverDefaultStepFee = tripQuoteDetail.driverDefaultStepFee,
+            rideRequestPopupDelayDuration = dpwRes.intelligentScores.rideRequestPopupDelayDuration,
+            baseFare = Just baseFare,
+            currency,
+            distanceUnit = searchReq.distanceUnit,
+            isPartOfIntelligentPool = dpwRes.isPartOfIntelligentPool,
+            acceptanceRatio = dpwRes.intelligentScores.acceptanceRatio,
+            cancellationRatio = dpwRes.intelligentScores.cancellationRatio,
+            driverAvailableTime = dpwRes.intelligentScores.availableTime,
+            driverSpeed = dpwRes.intelligentScores.driverSpeed,
+            keepHiddenForSeconds = dpwRes.keepHiddenForSeconds,
+            pickupZone = dpwRes.pickupZone,
+            mode = dpRes.mode,
+            goHomeRequestId = dpwRes.goHomeReqId,
+            rideFrequencyScore = dpwRes.intelligentScores.rideFrequency,
+            customerCancellationDues = fromMaybe 0 searchReq.customerCancellationDues,
+            clientSdkVersion = dpwRes.driverPoolResult.clientSdkVersion,
+            reactBundleVersion = dpwRes.driverPoolResult.reactBundleVersion,
+            clientBundleVersion = dpwRes.driverPoolResult.clientBundleVersion,
+            clientConfigVersion = dpwRes.driverPoolResult.clientConfigVersion,
+            clientDevice = dpwRes.driverPoolResult.clientDevice,
+            backendConfigVersion = dpwRes.driverPoolResult.backendConfigVersion,
+            backendAppVersion = Just deploymentVersion.getDeploymentVersion,
+            isForwardRequest = dpwRes.isForwardRequest,
+            previousDropGeoHash = dpwRes.previousDropGeoHash,
+            driverTags = Just $ addSpecialLocWarriorPreferredSpecialLocId dpwRes.specialLocWarriorPreferredSpecialLocId dpRes.driverTags,
+            customerTags = dpRes.customerTags,
+            poolingLogicVersion = searchReq.poolingLogicVersion,
+            poolingConfigVersion = searchReq.poolingConfigVersion,
+            notificationSource = Nothing,
+            totalRides = fromMaybe (-1) (driverStats <&> (.totalRides)),
+            renderedAt = Nothing,
+            respondedAt = Nothing,
+            middleStopCount = Just $ length searchReq.stops,
+            upgradeCabRequest = Just tripQuoteDetail.eligibleForUpgrade,
+            isFavourite = isFavourite,
+            parcelType = searchReq.parcelType,
+            parcelQuantity = searchReq.parcelQuantity,
+            driverTagScore = dpwRes.score,
+            conditionalCharges = additionalChargesEligiblFor,
+            isSafetyPlus = Just isEligibleForSafetyPlusCharge,
+            coinsRewardedOnGoldTierRide = driverCoinsRewardedOnGoldTierRideRequest,
+            commissionCharges = tripQuoteDetail.commissionCharges,
+            ..
+          }
+  pure searchRequestForDriver
+  where
+    addSpecialLocWarriorPreferredSpecialLocId mbSpecialLocId driverTags =
+      case mbSpecialLocId of
+        Nothing -> driverTags
+        Just specialLocId ->
+          let tagKey = AK.fromString "SpecialLocWarriorPreferredSpecialLoc"
+              tagValue = String specialLocId.getId
+           in case driverTags of
+                Object keymap -> Object $ AKM.insert tagKey tagValue keymap
+                _ -> Object $ AKM.singleton tagKey tagValue
+
+    additionalChargeConditional isEligibleForSafetyPlusCharge conditionalCharges = do
+      let safetyCharges = if isEligibleForSafetyPlusCharge then find (\ac -> ac == DAC.SAFETY_PLUS_CHARGES) $ map (.chargeCategory) conditionalCharges else Nothing
+      catMaybes $ [safetyCharges]
 
 buildTranslatedSearchReqLocation :: (TranslateFlow m r, EsqDBFlow m r, CacheFlow m r) => DLoc.Location -> Maybe Maps.Language -> m DLoc.Location
 buildTranslatedSearchReqLocation DLoc.Location {..} mbLanguage = do

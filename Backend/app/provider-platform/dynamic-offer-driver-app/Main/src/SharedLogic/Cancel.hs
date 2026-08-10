@@ -14,6 +14,7 @@
 
 module SharedLogic.Cancel where
 
+import qualified Control.Monad.Catch as C
 import qualified Data.HashMap.Strict as HM
 import qualified Data.HashMap.Strict as HMS
 import qualified Data.Map as M
@@ -31,17 +32,20 @@ import qualified Domain.Types.SearchRequest as DSR
 import qualified Domain.Types.SearchTry as DST
 import Domain.Types.TransporterConfig (TransporterConfig)
 import qualified Domain.Types.Vehicle as DVeh
+import Kernel.External.Types (ServiceFlow)
 import Kernel.Prelude
 import Kernel.Storage.Clickhouse.Config as CH
 import Kernel.Storage.Esqueleto.Config (EsqDBReplicaFlow)
 import Kernel.Storage.Hedis as Redis
 import Kernel.Streaming.Kafka.Producer.Types (HasKafkaProducer, KafkaProducerTools)
-import Kernel.Tools.Metrics.CoreMetrics (DeploymentVersion)
+import Kernel.Tools.Metrics.CoreMetrics (CoreMetrics, DeploymentVersion)
 import Kernel.Types.Id
 import Kernel.Utils.Common
 import Lib.ConfigPilot.Interface.Types (getOneConfig)
 import qualified Lib.Finance.Core.Types as Finance
+import Lib.Finance.Storage.Beam.BeamFlow (BeamFlow)
 import Lib.Scheduler (SchedulerType)
+import Lib.SessionizerMetrics.Types.Event (EventStreamFlow)
 import SharedLogic.Allocator.Jobs.SendSearchRequestToDrivers (sendSearchRequestToDrivers')
 import SharedLogic.Booking
 import qualified SharedLogic.CallBAP as BP
@@ -105,7 +109,19 @@ reAllocateBookingIfPossible ::
     HasField "enableLtsPoolDataForPooling" r Bool,
     Redis.HedisLTSFlowEnv r,
     ClickhouseFlow m r,
-    Finance.HasActorInfo m r
+    Finance.HasActorInfo m r,
+    Redis.HedisFlow m r,
+    BeamFlow m r,
+    CoreMetrics m,
+    MonadReader r m,
+    HasField "driverQuoteExpirationSeconds" r NominalDiffTime,
+    HasFlowEnv m r '["version" ::: DeploymentVersion],
+    EventStreamFlow m r,
+    HasPrettyLogger m r,
+    ServiceFlow m r,
+    HasField "quoteRespondCoolDown" r Int,
+    HasField "driverUnlockDelay" r Seconds,
+    C.MonadCatch m
   ) =>
   Bool ->
   Bool ->
@@ -118,6 +134,13 @@ reAllocateBookingIfPossible ::
   Bool ->
   m Bool
 reAllocateBookingIfPossible isValueAddNP userReallocationEnabled merchant booking ride driver vehicle bookingCReason isForceReallocation = do
+  -- AUTO_ACCEPT now goes through this shared mechanism like any other OneWay
+  -- OneWayOnDemandDynamicOffer tier (see nammayatri_auto_accept_tier_design memory /
+  -- the unified-instant-assign-pool plan) — its batch cycle already restricts eligible
+  -- candidates to its Cohort#AUTO_ACCEPT-tagged pool, so a rebroadcast here naturally
+  -- re-runs the same direct-assign-first logic. The old dedicated "never reallocate here"
+  -- guard was removed; see checkIfRepeatSearch below for the one remaining AUTO_ACCEPT
+  -- special-case this still needs (the uncapped-retry bypass).
   case booking.tripCategory of
     DTC.OneWay DTC.OneWayOnDemandDynamicOffer -> reallocateDynamicOffer
     DTC.Ambulance DTC.OneWayOnDemandDynamicOffer -> reallocateDynamicOffer
@@ -306,11 +329,18 @@ reAllocateBookingIfPossible isValueAddNP userReallocationEnabled merchant bookin
           arrivedPickupThreshold = highPrecMetersToMeters transporterConfig.arrivedPickupThreshold
           driverHasNotArrived = isNothing driverArrivalTime || maybe True (> arrivedPickupThreshold) bookingCReason.driverDistToPickup
           scheduleReallocationAllowed = transporterConfig.enableScheduleReallocation == Just True
+          -- AUTO_ACCEPT reassignment ignores isReallocationEnabled, which defaults False on the
+          -- standard search path and would otherwise block it. It also ignores searchTry.validTill,
+          -- which is sized for search/broadcast, not for how long a cancelled ride stays reassignable.
+          -- searchRepeatLimit still applies to AUTO_ACCEPT like every other tier. None of this
+          -- extends to other instantAcceptanceConfig tiers -- AUTO_ACCEPT only.
+          isAutoAccept = booking.vehicleServiceTier == DTC.AUTO_ACCEPT
+          isWithinRepeatLimit = searchTry.searchRepeatCounter < searchRepeatLimit
       return $
-        searchTry.searchRepeatCounter < searchRepeatLimit
+        isWithinRepeatLimit
           && (bookingCReason.source == SBCR.ByDriver || (bookingCReason.source == SBCR.ByFleetOwner && scheduleReallocationAllowed) || (bookingCReason.source == SBCR.ByUser && userReallocationEnabled))
-          && (isSearchTryValid || isScheduled)
-          && fromMaybe False isReallocationEnabled
+          && (isAutoAccept || isSearchTryValid || isScheduled)
+          && (isAutoAccept || fromMaybe False isReallocationEnabled)
           && (driverHasNotArrived || (scheduleReallocationAllowed && booking.startTime > now))
 
     buildBookingCancellationReason newBooking = do

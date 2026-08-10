@@ -14,6 +14,7 @@
 
 module SharedLogic.Ride where
 
+import qualified Control.Monad.Catch as C
 import Data.String.Conversions (cs)
 import qualified Data.Text as T
 import qualified Domain.Types.Booking as DBooking
@@ -44,15 +45,25 @@ import Kernel.External.Encryption (decrypt)
 import Kernel.External.Maps (LatLong (..))
 import qualified Kernel.External.Maps.Types as Maps
 import qualified Kernel.External.Notification as Notification
+import Kernel.External.Types (SchedulerFlow, ServiceFlow)
 import Kernel.Prelude
+import Kernel.Storage.Clickhouse.Config (ClickhouseFlow)
+import qualified Kernel.Storage.Clickhouse.Config as CH
+import Kernel.Storage.Esqueleto.Config (EsqDBReplicaFlow)
 import qualified Kernel.Storage.Hedis as Redis
+import Kernel.Streaming.Kafka.Producer.Types (HasKafkaProducer)
+import Kernel.Tools.Metrics.CoreMetrics (CoreMetrics, DeploymentVersion)
 import Kernel.Types.Id
+import Kernel.Types.Version (CloudType)
 import Kernel.Utils.Common
 import Lib.ConfigPilot.Interface.Types (getConfig, getOneConfig)
 import qualified Lib.DriverScore as DS
 import qualified Lib.DriverScore.Types as DST
 import qualified Lib.Finance.Core.Types as Finance
+import Lib.Finance.Storage.Beam.BeamFlow (BeamFlow)
 import qualified Lib.Payment.Domain.Types.PayoutRequest as DPR
+import Lib.Scheduler.Environment
+import Lib.SessionizerMetrics.Types.Event
 import qualified Lib.Types.SpecialLocation as SL
 import qualified SharedLogic.Analytics as Analytics
 import qualified SharedLogic.CallBAPInternal as CallBAPInternal
@@ -62,6 +73,7 @@ import qualified SharedLogic.External.LocationTrackingService.Types as LT
 import qualified SharedLogic.FareCalculator as FC
 import qualified SharedLogic.FarePolicy as SFP
 import SharedLogic.Finance.Prepaid
+import SharedLogic.FleetEngine (FleetEngineFlow)
 import qualified SharedLogic.FleetEngine as FleetEngine
 import qualified SharedLogic.ScheduledNotifications as SN
 import qualified Storage.CachedQueries.Driver.GoHomeRequest as CQDGR
@@ -95,6 +107,34 @@ isKaaliPeeliBooking booking =
    in tierNameOk
 
 initializeRide ::
+  ( MonadFlow m,
+    MonadReader r m,
+    TryException m,
+    MonadMask m,
+    EsqDBFlow m r,
+    EsqDBReplicaFlow m r,
+    CacheFlow m r,
+    EncFlow m r,
+    BeamFlow m r,
+    Finance.HasActorInfo m r,
+    Redis.HedisFlow m r,
+    Redis.HedisLTSFlowEnv r,
+    CoreMetrics m,
+    HasShortDurationRetryCfg r c,
+    EventStreamFlow m r,
+    ServiceFlow m r,
+    HasFlowEnv m r '["maxNotificationShards" ::: Int],
+    LT.HasLocationService m r,
+    JobCreator r m,
+    HasKafkaProducer r,
+    ClickhouseFlow m r,
+    FleetEngineFlow m r,
+    HasFlowEnv m r '["cloudType" ::: Maybe CloudType],
+    HasField "version" r DeploymentVersion,
+    HasField "selfUIUrl" r BaseUrl,
+    SchedulerFlow r,
+    HasField "blackListedJobs" r [Text]
+  ) =>
   Merchant ->
   DPerson.Person ->
   DBooking.Booking ->
@@ -103,111 +143,116 @@ initializeRide ::
   Maybe Text ->
   Maybe Bool ->
   Maybe (Id Person) ->
-  Flow (DRide.Ride, SRD.RideDetails, DVeh.Vehicle)
-initializeRide merchant driver booking mbOtpCode enableFrequentLocationUpdates mbClientId enableOtpLessRide mFleetOwnerId = do
-  let merchantId = merchant.id
-      isPrepaidSubscriptionAndWalletEnabled = fromMaybe False merchant.prepaidSubscriptionAndWalletEnabled
-  transporterConfig <- getOneConfig (TransporterConfigDimensions {merchantOperatingCityId = booking.merchantOperatingCityId.getId}) Nothing >>= fromMaybeM (TransporterConfigNotFound booking.merchantOperatingCityId.getId)
-  when isPrepaidSubscriptionAndWalletEnabled $ do
-    let (counterpartyType, ownerId) = case mFleetOwnerId of
-          Just fleetOwnerId -> (counterpartyFleetOwner, fleetOwnerId.getId)
-          Nothing -> (counterpartyDriver, driver.id.getId)
-        vehicleCategoryScopedPrepaidEnabled = fromMaybe False transporterConfig.subscriptionConfig.vehicleCategoryScopedPrepaidEnabled
-        mbVehicleCategory = if vehicleCategoryScopedPrepaidEnabled then Just (castServiceTierToVehicleCategory booking.vehicleServiceTier) else Nothing
-    mbAccount <- getPrepaidAccountByOwner counterpartyType ownerId mbVehicleCategory
-    -- if prepaid wallet isolation is enabled and there is no account, throw an error. It will prevent the ride from being created.
-    when (isPrepaidSubscriptionAndWalletEnabled && isNothing mbAccount) $ do
-      logError $
-        "Prepaid scoped RideCredit account missing at accept"
-          <> " | counterpartyType="
-          <> show counterpartyType
-          <> " | ownerId="
-          <> ownerId
-          <> " | vehicleCategory="
-          <> show mbVehicleCategory
-          <> " | bookingId="
-          <> booking.id.getId
-      throwError $
-        InvalidRequest "Prepaid ride credits are not available for this vehicle category. Purchase a subscription plan for this category."
-    whenJust mbAccount $ \_ -> do
-      Redis.withWaitOnLockRedisWithExpiry (makeSubscriptionRunningBalanceLockKey ownerId) 10 10 $ do
-        mbAvailableBalance <- getPrepaidAvailableBalanceByOwner counterpartyType ownerId mbVehicleCategory
-        let gstAmount = fromMaybe 0 booking.fareParams.govtCharges
-            tollAmount = fromMaybe 0 booking.fareParams.tollCharges
-            parkingAmount = fromMaybe 0 booking.fareParams.parkingCharge
-            rideFare = booking.estimatedFare - gstAmount - tollAmount - parkingAmount
-            threshold = fromMaybe 0 $ case mFleetOwnerId of
-              Just _ -> transporterConfig.subscriptionConfig.fleetPrepaidSubscriptionThreshold
-              Nothing -> transporterConfig.subscriptionConfig.prepaidSubscriptionThreshold
-            balance = fromMaybe 0 mbAvailableBalance
-        when (balance < rideFare + threshold) $ throwError (InvalidRequest "Low balance.")
-        _ <-
-          createPrepaidHold
-            counterpartyType
-            ownerId
-            rideFare
-            booking.currency
-            booking.providerId.getId
-            booking.merchantOperatingCityId.getId
-            booking.id.getId
-            Nothing
-            mbVehicleCategory
-            >>= fromEitherM (\err -> InternalError ("Failed to create prepaid hold: " <> show err))
-        pure ()
-  otpCode <-
-    case mbOtpCode of
-      Just otp -> pure otp
-      Nothing -> do
-        riderId <- booking.riderId & fromMaybeM (BookingFieldNotPresent "riderId")
-        riderDetails <- QRiderD.findById riderId >>= fromMaybeM (RiderDetailsNotFound riderId.getId)
-        case riderDetails.otpCode of
-          Nothing -> do
-            otpCode <- generateOTPCode
-            QRiderD.updateOtpCode (Just otpCode) riderDetails.id
-            pure otpCode
-          Just otp -> pure otp
-  ghrId <- CQDGR.setDriverGoHomeIsOnRideStatus driver.id booking.merchantOperatingCityId True
-  previousRideInprogress <- bool (QDI.findByPrimaryKey driver.id) (pure Nothing) (booking.isScheduled)
-  let isDriverOnRide = bool (Just False) (previousRideInprogress >>= Just . isJust <$> (.driverTripEndLocation)) (isJust previousRideInprogress)
-  now <- getCurrentTime
-  vehicle <- QVeh.findById driver.id >>= fromMaybeM (VehicleNotFound driver.id.getId)
-  mbFarePolicy <- SFP.getFarePolicyByEstOrQuoteIdWithoutFallback booking.quoteId
-  commission <- FC.calculateCommission booking.fareParams mbFarePolicy
-  cancellationCommission <- FC.calculateCancellationCommission booking.fareParams mbFarePolicy
-  ride <- buildRide driver booking ghrId otpCode enableFrequentLocationUpdates mbClientId previousRideInprogress now vehicle merchant.onlinePayment enableOtpLessRide mFleetOwnerId commission cancellationCommission
-  rideDetails <- buildRideDetails booking ride driver vehicle
-  QRB.updateStatus booking.id DBooking.TRIP_ASSIGNED
-  QRide.createRide ride
-  QRideD.create rideDetails
-  fork "updateRiderDetails" $ do
-    whenJust booking.riderId (QRiderD.updateTotalBookingsCount . getId)
-  Redis.withWaitOnLockRedisWithExpiry (isOnRideWithAdvRideConditionKey driver.id.getId) 4 4 $ do
-    when (not booking.isScheduled) $ do
-      whenJust (booking.toLocation) $ \toLoc -> do
-        QDI.updateTripCategoryAndTripEndLocationByDriverId (cast driver.id) (Just ride.tripCategory) (Just (Maps.LatLong toLoc.lat toLoc.lon))
-      QDI.updateOnRide True (cast driver.id)
-    Redis.unlockRedis (offerQuoteLockKeyWithCoolDown ride.driverId)
-    when (isDriverOnRide == Just True) $ QDI.updateHasAdvancedRide (cast ride.driverId) True
-    Redis.unlockRedis (editDestinationLockKey ride.driverId)
-  unless booking.isScheduled $ void $ LF.rideDetails ride.id DRide.NEW merchantId ride.driverId booking.fromLocation.lat booking.fromLocation.lon (Just ride.isAdvanceBooking) (Just (LT.Car $ LT.CarRideInfo {pickupLocation = LatLong (booking.fromLocation.lat) (booking.fromLocation.lon), minDistanceBetweenTwoPoints = Nothing, rideStops = Just $ map (\stop -> LatLong stop.lat stop.lon) booking.stops}))
-
-  triggerRideCreatedEvent RideEventData {ride = ride, personId = cast driver.id, merchantId = merchantId}
-  QBE.logDriverAssignedEvent (cast driver.id) booking.id ride.id booking.distanceUnit
-
-  if booking.isScheduled
-    then Notify.driverScheduledRideAcceptanceAlert booking.merchantOperatingCityId Notification.SCHEDULED_RIDE_NOTIFICATION notificationTitle (messageForScheduled booking) driver driver.deviceToken
-    else Notify.notifyDriverWithProviders booking.merchantOperatingCityId notificationType notificationTitle (message booking) driver driver.deviceToken (Just ride.id) EmptyDynamicParam
-
-  fork "DriverScoreEventHandler OnNewRideAssigned" $
-    DS.driverScoreEventHandler booking.merchantOperatingCityId DST.OnNewRideAssigned {merchantId = merchantId, driverId = ride.driverId, currency = ride.currency, distanceUnit = booking.distanceUnit}
-
-  fork "FleetEngine: create trip on ride assigned" $ FleetEngine.notifyTripCreated booking ride
-
-  notifyRideRelatedNotificationOnEvent ride now DRN.RIDE_ASSIGNED
-  notifyRideRelatedNotificationOnEvent ride now DRN.PICKUP_TIME
-
-  return (ride, rideDetails, vehicle)
+  m (DRide.Ride, SRD.RideDetails, DVeh.Vehicle)
+initializeRide merchant driver booking mbOtpCode enableFrequentLocationUpdates mbClientId enableOtpLessRide mFleetOwnerId =
+  initializeRideAction `C.onException` Redis.unlockRedis (offerQuoteLockKeyWithCoolDown driver.id)
   where
+    -- Any throw between the lock being taken (by the caller, before initializeRide is called)
+    -- and its normal release point below (inside the isOnRideWithAdvRideConditionKey block)
+    -- must not leave offerQuoteLockKeyWithCoolDown held for the full cooldown TTL.
+    initializeRideAction = do
+      let merchantId = merchant.id
+          isPrepaidSubscriptionAndWalletEnabled = fromMaybe False merchant.prepaidSubscriptionAndWalletEnabled
+      transporterConfig <- getOneConfig (TransporterConfigDimensions {merchantOperatingCityId = booking.merchantOperatingCityId.getId}) Nothing >>= fromMaybeM (TransporterConfigNotFound booking.merchantOperatingCityId.getId)
+      when isPrepaidSubscriptionAndWalletEnabled $ do
+        let (counterpartyType, ownerId) = case mFleetOwnerId of
+              Just fleetOwnerId -> (counterpartyFleetOwner, fleetOwnerId.getId)
+              Nothing -> (counterpartyDriver, driver.id.getId)
+            vehicleCategoryScopedPrepaidEnabled = fromMaybe False transporterConfig.subscriptionConfig.vehicleCategoryScopedPrepaidEnabled
+            mbVehicleCategory = if vehicleCategoryScopedPrepaidEnabled then Just (castServiceTierToVehicleCategory booking.vehicleServiceTier) else Nothing
+        mbAccount <- getPrepaidAccountByOwner counterpartyType ownerId mbVehicleCategory
+        -- if prepaid wallet isolation is enabled and there is no account, throw an error. It will prevent the ride from being created.
+        when (isPrepaidSubscriptionAndWalletEnabled && isNothing mbAccount) $ do
+          logError $
+            "Prepaid scoped RideCredit account missing at accept"
+              <> " | counterpartyType="
+              <> show counterpartyType
+              <> " | ownerId="
+              <> ownerId
+              <> " | vehicleCategory="
+              <> show mbVehicleCategory
+              <> " | bookingId="
+              <> booking.id.getId
+          throwError $
+            InvalidRequest "Prepaid ride credits are not available for this vehicle category. Purchase a subscription plan for this category."
+        whenJust mbAccount $ \_ -> do
+          Redis.withWaitOnLockRedisWithExpiry (makeSubscriptionRunningBalanceLockKey ownerId) 10 10 $ do
+            mbAvailableBalance <- getPrepaidAvailableBalanceByOwner counterpartyType ownerId mbVehicleCategory
+            let gstAmount = fromMaybe 0 booking.fareParams.govtCharges
+                tollAmount = fromMaybe 0 booking.fareParams.tollCharges
+                parkingAmount = fromMaybe 0 booking.fareParams.parkingCharge
+                rideFare = booking.estimatedFare - gstAmount - tollAmount - parkingAmount
+                threshold = fromMaybe 0 $ case mFleetOwnerId of
+                  Just _ -> transporterConfig.subscriptionConfig.fleetPrepaidSubscriptionThreshold
+                  Nothing -> transporterConfig.subscriptionConfig.prepaidSubscriptionThreshold
+                balance = fromMaybe 0 mbAvailableBalance
+            when (balance < rideFare + threshold) $ throwError (InvalidRequest "Low balance.")
+            _ <-
+              createPrepaidHold
+                counterpartyType
+                ownerId
+                rideFare
+                booking.currency
+                booking.providerId.getId
+                booking.merchantOperatingCityId.getId
+                booking.id.getId
+                Nothing
+                mbVehicleCategory
+                >>= fromEitherM (\err -> InternalError ("Failed to create prepaid hold: " <> show err))
+            pure ()
+      otpCode <-
+        case mbOtpCode of
+          Just otp -> pure otp
+          Nothing -> do
+            riderId <- booking.riderId & fromMaybeM (BookingFieldNotPresent "riderId")
+            riderDetails <- QRiderD.findById riderId >>= fromMaybeM (RiderDetailsNotFound riderId.getId)
+            case riderDetails.otpCode of
+              Nothing -> do
+                otpCode <- generateOTPCode
+                QRiderD.updateOtpCode (Just otpCode) riderDetails.id
+                pure otpCode
+              Just otp -> pure otp
+      ghrId <- CQDGR.setDriverGoHomeIsOnRideStatus driver.id booking.merchantOperatingCityId True
+      previousRideInprogress <- bool (QDI.findByPrimaryKey driver.id) (pure Nothing) (booking.isScheduled)
+      let isDriverOnRide = bool (Just False) (previousRideInprogress >>= Just . isJust <$> (.driverTripEndLocation)) (isJust previousRideInprogress)
+      now <- getCurrentTime
+      vehicle <- QVeh.findById driver.id >>= fromMaybeM (VehicleNotFound driver.id.getId)
+      mbFarePolicy <- SFP.getFarePolicyByEstOrQuoteIdWithoutFallback booking.quoteId
+      commission <- FC.calculateCommission booking.fareParams mbFarePolicy
+      cancellationCommission <- FC.calculateCancellationCommission booking.fareParams mbFarePolicy
+      ride <- buildRide driver booking ghrId otpCode enableFrequentLocationUpdates mbClientId previousRideInprogress now vehicle merchant.onlinePayment enableOtpLessRide mFleetOwnerId commission cancellationCommission
+      rideDetails <- buildRideDetails booking ride driver vehicle
+      QRB.updateStatus booking.id DBooking.TRIP_ASSIGNED
+      QRide.createRide ride
+      QRideD.create rideDetails
+      fork "updateRiderDetails" $ do
+        whenJust booking.riderId (QRiderD.updateTotalBookingsCount . getId)
+      Redis.withWaitOnLockRedisWithExpiry (isOnRideWithAdvRideConditionKey driver.id.getId) 4 4 $ do
+        when (not booking.isScheduled) $ do
+          whenJust (booking.toLocation) $ \toLoc -> do
+            QDI.updateTripCategoryAndTripEndLocationByDriverId (cast driver.id) (Just ride.tripCategory) (Just (Maps.LatLong toLoc.lat toLoc.lon))
+          QDI.updateOnRide True (cast driver.id)
+        Redis.unlockRedis (offerQuoteLockKeyWithCoolDown ride.driverId)
+        when (isDriverOnRide == Just True) $ QDI.updateHasAdvancedRide (cast ride.driverId) True
+        Redis.unlockRedis (editDestinationLockKey ride.driverId)
+      unless booking.isScheduled $ void $ LF.rideDetails ride.id DRide.NEW merchantId ride.driverId booking.fromLocation.lat booking.fromLocation.lon (Just ride.isAdvanceBooking) (Just (LT.Car $ LT.CarRideInfo {pickupLocation = LatLong (booking.fromLocation.lat) (booking.fromLocation.lon), minDistanceBetweenTwoPoints = Nothing, rideStops = Just $ map (\stop -> LatLong stop.lat stop.lon) booking.stops}))
+
+      triggerRideCreatedEvent RideEventData {ride = ride, personId = cast driver.id, merchantId = merchantId}
+      QBE.logDriverAssignedEvent (cast driver.id) booking.id ride.id booking.distanceUnit
+
+      if booking.isScheduled
+        then Notify.driverScheduledRideAcceptanceAlert booking.merchantOperatingCityId Notification.SCHEDULED_RIDE_NOTIFICATION notificationTitle (messageForScheduled booking) driver driver.deviceToken
+        else Notify.notifyDriverWithProviders booking.merchantOperatingCityId notificationType notificationTitle (message booking) driver driver.deviceToken (Just ride.id) EmptyDynamicParam
+
+      fork "DriverScoreEventHandler OnNewRideAssigned" $
+        DS.driverScoreEventHandler booking.merchantOperatingCityId DST.OnNewRideAssigned {merchantId = merchantId, driverId = ride.driverId, currency = ride.currency, distanceUnit = booking.distanceUnit}
+
+      fork "FleetEngine: create trip on ride assigned" $ FleetEngine.notifyTripCreated booking ride
+
+      notifyRideRelatedNotificationOnEvent ride now DRN.RIDE_ASSIGNED
+      notifyRideRelatedNotificationOnEvent ride now DRN.PICKUP_TIME
+
+      return (ride, rideDetails, vehicle)
     notificationType = Notification.DRIVER_ASSIGNMENT
     notificationTitle = "Driver has been assigned the ride!"
 
@@ -422,11 +467,16 @@ safeApplyVehicleBalanceForPayout pr = do
           QDRPB.updateByPrimaryKey (rcAccount {DDPBA.vehicleBalance = Just newBalance})
 
 buildRideDetails ::
+  ( MonadFlow m,
+    EncFlow m r,
+    EsqDBFlow m r,
+    CacheFlow m r
+  ) =>
   DBooking.Booking ->
   DRide.Ride ->
   DPerson.Person ->
   DVeh.Vehicle ->
-  Flow SRD.RideDetails
+  m SRD.RideDetails
 buildRideDetails booking ride driver vehicle = do
   now <- getCurrentTime
   vehicleRegCert <- QVRC.findLastVehicleRCWrapper vehicle.registrationNo
@@ -453,6 +503,14 @@ buildRideDetails booking ride driver vehicle = do
       }
 
 buildRide ::
+  ( MonadFlow m,
+    CacheFlow m r,
+    EsqDBFlow m r,
+    HasFlowEnv m r '["cloudType" ::: Maybe CloudType],
+    HasField "version" r DeploymentVersion,
+    HasField "selfUIUrl" r BaseUrl,
+    MonadReader r m
+  ) =>
   DPerson.Person ->
   DBooking.Booking ->
   Maybe (Id DGetHomeRequest.DriverGoHomeRequest) ->
@@ -467,7 +525,7 @@ buildRide ::
   Maybe (Id Person) ->
   Maybe HighPrecMoney ->
   Maybe HighPrecMoney ->
-  Flow DRide.Ride
+  m DRide.Ride
 buildRide driver booking ghrId otp enableFrequentLocationUpdates clientId dinfo now vehicle onlinePayment enableOtpLessRide mFleetOwnerId commission cancellationCommission = do
   guid <- Id <$> generateGUID
   shortId <- generateShortId
@@ -585,7 +643,7 @@ buildRide driver booking ghrId otp enableFrequentLocationUpdates clientId dinfo 
         referralFlagReason = Nothing
       }
 
-buildTrackingUrl :: Id DRide.Ride -> Flow BaseUrl
+buildTrackingUrl :: (MonadFlow m, HasField "selfUIUrl" r BaseUrl, MonadReader r m) => Id DRide.Ride -> m BaseUrl
 buildTrackingUrl rideId = do
   bppUIUrl <- asks (.selfUIUrl)
   let rideid = T.unpack (getId rideId)
@@ -606,7 +664,24 @@ deactivateExistingQuotes merchantOpCityId merchantId quoteDriverId searchTryId e
   pullExistingRideRequests merchantOpCityId driverSearchReqs merchantId quoteDriverId estimatedFare transporterConfig
   return driverSearchReqs
 
-pullExistingRideRequests :: Id DTMM.MerchantOperatingCity -> [SearchRequestForDriver] -> Id Merchant -> Id Person -> Price -> DTC.TransporterConfig -> Flow ()
+pullExistingRideRequests ::
+  ( MonadFlow m,
+    EsqDBFlow m r,
+    CacheFlow m r,
+    Redis.HedisFlow m r,
+    ServiceFlow m r,
+    HasFlowEnv m r '["maxNotificationShards" ::: Int],
+    Redis.HedisLTSFlowEnv r,
+    HasField "serviceClickhouseCfg" r CH.ClickhouseCfg,
+    HasField "serviceClickhouseEnv" r CH.ClickhouseEnv
+  ) =>
+  Id DTMM.MerchantOperatingCity ->
+  [SearchRequestForDriver] ->
+  Id Merchant ->
+  Id Person ->
+  Price ->
+  DTC.TransporterConfig ->
+  m ()
 pullExistingRideRequests merchantOpCityId driverSearchReqs merchantId quoteDriverId estimatedFare transporterConfig = do
   for_ driverSearchReqs $ \driverReq -> do
     let driverId = driverReq.driverId
@@ -719,3 +794,4 @@ getArrivalTimeBufferOfVehicle bufferJson serviceTier =
     DST.AUTO_LITE -> buffer.autorickshaw
     DST.PINK_AUTO -> buffer.autorickshaw
     DST.MAHILA_SHAKTI -> buffer.autorickshaw
+    DST.AUTO_ACCEPT -> buffer.autorickshaw
