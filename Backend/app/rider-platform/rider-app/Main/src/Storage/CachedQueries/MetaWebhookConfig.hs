@@ -16,8 +16,8 @@
 -- webhook POST, so a plain DB hit per request would be a real regression
 -- versus the old in-memory Dhall list. Modeled on
 -- Storage.CachedQueries.Merchant.MerchantServiceConfig: read-through cache,
--- invalidate (not populate) on write. Only ciphertext (appSecret/verifyToken)
--- ever touches Redis — MetaWebhookConfig's ToJSON/FromJSON never sees plaintext.
+-- invalidate (not populate) on write. Only ciphertext (appSecret/verifyToken/
+-- accessToken) ever touches Redis — MetaWebhookConfig's ToJSON/FromJSON never sees plaintext.
 module Storage.CachedQueries.MetaWebhookConfig
   ( findByPhoneNumberId,
     create,

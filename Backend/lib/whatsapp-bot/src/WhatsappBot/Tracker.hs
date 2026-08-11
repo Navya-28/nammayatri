@@ -15,6 +15,7 @@ module WhatsappBot.Tracker
   )
 where
 
+import qualified Data.Map.Strict as Map
 import Kernel.Prelude
 import WhatsappBot.Handles
   ( Clock,
@@ -23,7 +24,7 @@ import WhatsappBot.Handles
     SessionStore (..),
     WaSender (..),
   )
-import WhatsappBot.I18n.Types (SupportedLanguage)
+import WhatsappBot.I18n.Types (LanguageStrings, SupportedLanguage)
 import WhatsappBot.Messages
   ( BuiltMessage (..),
     RideStage (..),
@@ -44,7 +45,11 @@ data TrackerDeps m = TrackerDeps
     tdGetBookingDetails :: BotAuth -> Text -> m (Either BotError (Maybe BotBookingDetails)),
     tdSender :: WaSender m,
     tdSessions :: SessionStore m,
-    tdClock :: Clock m
+    tdClock :: Clock m,
+    -- | Same per-language string tables as 'WhatsappBot.Env.BotConfig.translations'
+    -- (see there); the tracker builds its own outbound copy independently of the
+    -- in-handler engine, so it needs its own copy of the map.
+    tdTranslations :: Map.Map SupportedLanguage LanguageStrings
   }
 
 -- | Progress rank for the non-terminal notify-once stages
@@ -79,8 +84,8 @@ processRide deps entry = do
 
 dispatch :: (Monad m) => TrackerDeps m -> RegisteredRide -> BotBookingDetails -> RideStage -> m ()
 dispatch deps entry booking stage = case stage of
-  StageCancelled -> terminal deps entry "cancelled" (buildCancelled entry.language)
-  StageCompleted -> terminal deps entry "completed" (buildEnded booking entry.language)
+  StageCancelled -> terminal deps entry "cancelled" (buildCancelled deps.tdTranslations entry.language)
+  StageCompleted -> terminal deps entry "completed" (buildEnded deps.tdTranslations booking entry.language)
   _ -> progressive deps entry booking stage
 
 -- | Terminal stage (@ride-tracker.ts:118-139@): claim-once, send, and only on a
@@ -112,19 +117,19 @@ progressive deps entry booking stage = do
     delivered <-
       if won
         then do
-          d <- sendMsg deps entry (buildFor stage booking entry.language)
+          d <- sendMsg deps entry (buildFor deps.tdTranslations stage booking entry.language)
           unless d $ deps.tdRegistry.releaseStage entry.bookingId reached
           pure d
         else pure True
     when delivered $ deps.tdRegistry.updateRide entry {lastStage = Just reached}
 
 -- | @ride-tracker.ts:156-163@.
-buildFor :: RideStage -> BotBookingDetails -> Maybe SupportedLanguage -> BuiltMessage
-buildFor stage booking lang = case stage of
-  StageAssigned -> buildDriverCard booking lang
-  StageArrived -> buildArrived booking lang
-  StageStarted -> buildStarted booking lang
-  _ -> buildDriverCard booking lang
+buildFor :: Map.Map SupportedLanguage LanguageStrings -> RideStage -> BotBookingDetails -> Maybe SupportedLanguage -> BuiltMessage
+buildFor translations stage booking lang = case stage of
+  StageAssigned -> buildDriverCard translations booking lang
+  StageArrived -> buildArrived translations booking lang
+  StageStarted -> buildStarted translations booking lang
+  _ -> buildDriverCard translations booking lang
 
 -- | Send via buttons when present, else text; returns whether WhatsApp accepted
 -- it so the caller can retry (@ride-tracker.ts:166-171@).

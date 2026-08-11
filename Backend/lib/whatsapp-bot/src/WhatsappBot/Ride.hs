@@ -168,7 +168,7 @@ listedBookings env auth ctx window = do
 -- | @handleStatus@ (@engine.ts:1236-1280@): the rider's active ride + Call/Cancel.
 handleStatus :: Monad m => BotEnv m -> InboundEvent -> FlowContext -> m ()
 handleStatus env ev ctx = do
-  let s = t ctx.language
+  let s = t env.cfg.translations ctx.language
       to = ev.fromPhone
   mb <- currentRide env ev ctx
   case mb of
@@ -192,7 +192,7 @@ handleStatus env ev ctx = do
 -- | @handleTracking@ (@engine.ts:1189-1234@): ride status + SOS/112/Cancel.
 handleTracking :: Monad m => BotEnv m -> InboundEvent -> FlowContext -> m ()
 handleTracking env ev ctx = do
-  let s = t ctx.language
+  let s = t env.cfg.translations ctx.language
       to = ev.fromPhone
   mb <- currentRide env ev ctx
   case mb of
@@ -239,7 +239,7 @@ defaultTrackingUrl = "https://www.nammayatri.in/u?vp=shareRide&rideId={rideId}"
 -- module header: the row belongs to a FLOW, and this module must not import one.
 handleCancel :: Monad m => BotEnv m -> InboundEvent -> FlowContext -> (LanguageStrings -> m [OutButton]) -> Text -> m ()
 handleCancel env ev ctx mkRow input = do
-  let s = t ctx.language
+  let s = t env.cfg.translations ctx.language
       to = ev.fromPhone
       explicitBookingId = if "cancel:" `T.isPrefixOf` input then Just (T.drop 7 input) else Nothing
   case ctx.personId of
@@ -297,7 +297,7 @@ handleCancel env ev ctx mkRow input = do
 -- name when known.
 handleCancelConfirm :: Monad m => BotEnv m -> InboundEvent -> FlowContext -> Text -> m ()
 handleCancelConfirm env ev ctx input = do
-  let s = t ctx.language
+  let s = t env.cfg.translations ctx.language
       to = ev.fromPhone
       bookingId = if ":" `T.isInfixOf` input then T.intercalate ":" (drop 1 (T.splitOn ":" input)) else ""
       yesData = if T.null bookingId then "cancel" else "cancel:" <> bookingId
@@ -326,7 +326,7 @@ handleCancelConfirm env ev ctx input = do
 -- | @sos_trigger@ (@engine.ts:197-223@): find the active ride, trigger SOS.
 handleSosTrigger :: Monad m => BotEnv m -> InboundEvent -> FlowContext -> m ()
 handleSosTrigger env ev ctx = do
-  let s = t ctx.language
+  let s = t env.cfg.translations ctx.language
       to = ev.fromPhone
       auth = BotAuth (fromMaybe "" ctx.personId)
   -- RAW ctx.selectStartedAt — no 24h floor. sos-no-select-time.json pins
@@ -354,7 +354,7 @@ handleSosTrigger env ev ctx = do
 -- | @mark_safe_trigger@ (@engine.ts:237-249@): call markRideAsSafe, clear the SOS.
 handleMarkSafeTrigger :: Monad m => BotEnv m -> InboundEvent -> FlowContext -> m ()
 handleMarkSafeTrigger env ev ctx = do
-  let s = t ctx.language
+  let s = t env.cfg.translations ctx.language
       to = ev.fromPhone
       auth = BotAuth (fromMaybe "" ctx.personId)
   case ctx.sosId of
@@ -376,7 +376,7 @@ handleMarkSafeTrigger env ev ctx = do
 -- | @call_driver@ (@engine.ts:389-406@): reveal the driver's dial number.
 handleCallDriver :: Monad m => BotEnv m -> InboundEvent -> FlowContext -> m ()
 handleCallDriver env ev ctx = do
-  let s = t ctx.language
+  let s = t env.cfg.translations ctx.language
       to = ev.fromPhone
       auth = BotAuth (fromMaybe "" ctx.personId)
   -- RAW ctx.selectStartedAt, same as the SOS path — no 24h floor.

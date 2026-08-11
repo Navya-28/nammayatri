@@ -81,6 +81,12 @@ import WhatsappBot.Engine (handleMessage)
 import WhatsappBot.Env
 import WhatsappBot.Handles
 import WhatsappBot.I18n.En (en)
+import WhatsappBot.I18n.Gu (gu)
+import WhatsappBot.I18n.Hi (hi)
+import WhatsappBot.I18n.Kn (kn)
+import WhatsappBot.I18n.Ta (ta)
+import WhatsappBot.I18n.Te (te)
+import WhatsappBot.I18n.Types (LanguageStrings, SupportedLanguage (..))
 import WhatsappBot.Inbound (parseInbound)
 import WhatsappBot.Tracker (TrackerDeps (..), trackerTick)
 import WhatsappBot.Types
@@ -431,12 +437,15 @@ mkBackend rb =
         guard1 rb "updateProfile" (pure ())
     }
   where
-    -- Any phone authenticates as a returning user EXCEPT one containing "00000"
-    -- (the OTP/new-user path); no golden uses such a phone (mock-client.ts:52-62).
-    authResult p =
-      if "00000" `T.isInfixOf` p
-        then Left (BotError "Person not found")
-        else Right (BotAuth "mock-person-1")
+    -- A phone containing "00000" is the OTP/new-user-auth-failure path
+    -- (mock-client.ts:52-62). "7411122233" is one of the 4 allowedPhones
+    -- below, but unused by any other fixture — dedicated here as the
+    -- "already-known, named" segment (see welcome-back.json). Every other
+    -- allowed phone is a genuinely first-time user.
+    authResult p
+      | "00000" `T.isInfixOf` p = Left (BotError "Person not found")
+      | p == "7411122233" = Right AuthResult {auth = BotAuth "mock-person-2", segment = ExistingApp, displayName = Just "Priya"}
+      | otherwise = Right AuthResult {auth = BotAuth "mock-person-1", segment = NewUser, displayName = Nothing}
 
 -- | Recording WaSender. Merchant label is closed over (one merchant per fixture).
 -- A buttons/list send is recorded identically (kind="buttons", data-ids only).
@@ -592,8 +601,16 @@ fixtureConfig m =
       regularEstimatePollIntervalMs = 2000,
       driverPollAttempts = 90,
       driverPollIntervalMs = 2000,
-      driverPollNotifyEvery = 15
+      driverPollNotifyEvery = 15,
+      translations = staticTranslations
     }
+
+-- | The same static compiled tables as production's DB-less default (no DB in
+-- the golden harness), so every fixture keeps asserting against the identical
+-- copy it always has — a real proof that threading the translations map
+-- through the engine didn't change any behaviour.
+staticTranslations :: Map.Map SupportedLanguage LanguageStrings
+staticTranslations = Map.fromList [(En, en), (Hi, hi), (Gu, gu), (Kn, kn), (Ta, ta), (Te, te)]
 
 -- ===========================================================================
 -- World builder.
@@ -646,7 +663,8 @@ makeWorld merchantCtx theKnobs t0 = do
             tdGetBookingDetails = backendH.getBookingDetails,
             tdSender = senderH,
             tdSessions = sessionsH,
-            tdClock = clockH
+            tdClock = clockH,
+            tdTranslations = staticTranslations
           }
   pure
     World
@@ -819,7 +837,8 @@ fixtureGuards =
             "sos-no-select-time.json",
             "sos-trigger.json",
             "status-tracking.json",
-            "token-expiry-reauth.json"
+            "token-expiry-reauth.json",
+            "welcome-back.json"
           ]
           (L.sort (map fst goldenFiles))
     ]

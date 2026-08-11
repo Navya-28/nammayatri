@@ -12,7 +12,10 @@ import qualified Kernel.Prelude
 import Tools.Beam.UtilsTH
 
 data MetaWebhookConfigT f = MetaWebhookConfigT
-  { appSecret :: (B.C f Kernel.Prelude.Text),
+  { accessToken :: (B.C f Kernel.Prelude.Text),
+    apiVersion :: (B.C f Kernel.Prelude.Text),
+    appSecret :: (B.C f Kernel.Prelude.Text),
+    baseUrl :: (B.C f Kernel.Prelude.Text),
     botConfig :: (B.C f Data.Aeson.Value),
     createdAt :: (B.C f Kernel.Prelude.UTCTime),
     enabled :: (B.C f Kernel.Prelude.Bool),
@@ -33,4 +36,4 @@ type MetaWebhookConfig = MetaWebhookConfigT Identity
 
 $(enableKVPG (''MetaWebhookConfigT) [('id)] [[('phoneNumberId)]])
 
-$(mkTableInstances (''MetaWebhookConfigT) "meta_webhook_config")
+$(mkTableInstances (''MetaWebhookConfigT) "meta_config")

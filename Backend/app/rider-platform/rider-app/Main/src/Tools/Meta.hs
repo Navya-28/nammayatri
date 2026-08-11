@@ -14,27 +14,31 @@
 
 module Tools.Meta (lookupMetaCfg) where
 
-import qualified Domain.Types.Merchant as DM
-import qualified Domain.Types.MerchantOperatingCity as DMOC
-import qualified Domain.Types.MerchantServiceConfig as DMSC
+import qualified Domain.Types.MetaWebhookConfig as DMWC
 import Environment
 import EulerHS.Prelude hiding (id)
 import qualified Kernel.External.Meta.Config as Meta
-import Kernel.Types.Error
-import qualified Kernel.Types.Id as KId
-import Kernel.Utils.Common
-import qualified Storage.CachedQueries.Merchant.MerchantServiceConfig as CQMSC
+import Kernel.Prelude (parseBaseUrl)
 
--- | Fetch the (encrypted) Meta WhatsApp Cloud API config for a merchant-city
--- from its @merchant_service_config@ row (mirrors Xyne's @lookupXyneCfg@). The
--- access token stays @EncryptedField@-encrypted here; only
--- @Kernel.External.Meta.Flow.sendMessage@ decrypts it, at call time. Webhook
--- secrets (verifyToken\/appSecret) live in app-env, not this row.
-lookupMetaCfg :: KId.Id DM.Merchant -> KId.Id DMOC.MerchantOperatingCity -> Flow Meta.MetaCfg
-lookupMetaCfg merchantId mocId = do
-  msc <-
-    CQMSC.findByMerchantOpCityIdAndService merchantId mocId (DMSC.MetaService DMSC.CloudApi)
-      >>= fromMaybeM (InternalError $ "Meta config not found for merchantOperatingCityId: " <> mocId.getId)
-  case msc.serviceConfig of
-    DMSC.MetaServiceConfig cfg -> pure cfg
-    _ -> throwError (InternalError "Unexpected service config shape for Meta")
+-- | Build the (encrypted) Meta WhatsApp Cloud API send-config straight off an
+-- already-fetched 'DMWC.MetaWebhookConfig' row — no second DB query. Used to
+-- live in @merchant_service_config@'s @Meta_CloudApi@ row (a separate table,
+-- looked up by a separate key), which meant this table's @phoneNumberId@ and
+-- that row's @phoneNumberId@ had to agree at runtime (drift-guard in
+-- Adapter/Env.hs). accessToken/baseUrl/apiVersion moved onto this table
+-- (dev/ddl-migrations/rider-app/1561-meta-config-rename-and-access-token.sql
+-- + dev/feature-migrations/0047-meta-config-access-token-backfill.sql,
+-- tightened to NOT NULL in 1562-meta-config-access-token-not-null.sql) so
+-- there's exactly one row and nothing left to drift. The access token stays
+-- @EncryptedField@-encrypted here; only @Kernel.External.Meta.Flow.sendMessage@
+-- decrypts it, at call time.
+lookupMetaCfg :: DMWC.MetaWebhookConfig -> Flow Meta.MetaCfg
+lookupMetaCfg cfg = do
+  baseUrl <- parseBaseUrl cfg.baseUrl
+  pure
+    Meta.MetaCfg
+      { accessToken = cfg.accessToken,
+        phoneNumberId = cfg.phoneNumberId,
+        baseUrl = baseUrl,
+        apiVersion = cfg.apiVersion
+      }

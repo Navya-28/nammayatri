@@ -857,6 +857,7 @@ library
       WhatsappBot.Adapter.Sender
       WhatsappBot.Adapter.SessionStore
       WhatsappBot.Adapter.Tracker
+      WhatsappBot.Adapter.Translations
       API.Action.Dashboard.AppManagement
       API.Action.Dashboard.AppManagement.Customer
       API.Action.Dashboard.AppManagement.EDCMachine

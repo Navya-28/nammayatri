@@ -14,6 +14,7 @@ module WhatsappBot.I18n
   )
 where
 
+import qualified Data.Map.Strict as Map
 import Kernel.Prelude
 import WhatsappBot.I18n.Detect (detectLanguage)
 import WhatsappBot.I18n.En (en)
@@ -25,15 +26,14 @@ import WhatsappBot.I18n.Te (te)
 import WhatsappBot.I18n.Types
 
 -- | The string table for a language; unset/unknown -> English (@index.ts:20-22@).
-t :: Maybe SupportedLanguage -> LanguageStrings
-t = \case
-  Just En -> en
-  Just Hi -> hi
-  Just Gu -> gu
-  Just Kn -> kn
-  Just Ta -> ta
-  Just Te -> te
-  Nothing -> en
+--
+-- Takes the per-conversation translations map (built once per session/tick by
+-- the rider-app adapter from the DB-backed @translations@ table, falling back
+-- field-by-field to the static compiled tables above) instead of switching on
+-- the static tables directly, so a DB row can override any field without a
+-- redeploy. Still 100% pure: the map is a pre-resolved value, not an effect.
+t :: Map.Map SupportedLanguage LanguageStrings -> Maybe SupportedLanguage -> LanguageStrings
+t m ml = Map.findWithDefault en (fromMaybe En ml) m
 
 -- | One row of the language chooser (@index.ts:24-32@).
 data LanguageInfo = LanguageInfo

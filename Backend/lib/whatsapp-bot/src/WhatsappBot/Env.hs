@@ -51,10 +51,11 @@ where
 
 import Control.Applicative ((<|>))
 import Data.Char (isDigit)
+import qualified Data.Map.Strict as Map
 import qualified Data.Text as T
 import Kernel.Prelude
 import WhatsappBot.Handles
-import WhatsappBot.I18n (LanguageStrings, t)
+import WhatsappBot.I18n (LanguageStrings, SupportedLanguage, t)
 -- Instances only: LanguageStrings / LanguageInfo are dot-accessed via RDP
 -- (getField), so their selectors are never referenced by name, but the HasField
 -- instances are needed. (Naming them would trip -Wunused-imports under -Werror.)
@@ -80,7 +81,13 @@ data BotConfig = BotConfig
     -- progress notify every 15).
     driverPollAttempts :: Int,
     driverPollIntervalMs :: Int,
-    driverPollNotifyEvery :: Int
+    driverPollNotifyEvery :: Int,
+    -- | Per-language string tables, DB rows layered over the static compiled
+    -- defaults (built once per session/tick by the rider-app adapter). Passed
+    -- to every 'WhatsappBot.I18n.t' call so DB-edited copy takes effect
+    -- without a redeploy; a language with no DB rows resolves identically to
+    -- today's static table (see "WhatsappBot.I18n" for the fallback).
+    translations :: Map.Map SupportedLanguage LanguageStrings
   }
 
 -- INVARIANT — do not weaken. The engine is polymorphic in @m@ with @Monad m@ as
@@ -159,7 +166,7 @@ ensureAuth ::
   FlowContext ->
   m (Maybe FlowContext)
 ensureAuth env ev hook ctx = do
-  let s = t ctx.language
+  let s = t env.cfg.translations ctx.language
       to = ev.fromPhone
       uk = mkUserKey env.cfg.merchant ev
   case ctx.personId of
@@ -185,7 +192,16 @@ ensureAuth env ev hook ctx = do
                 reply env to (s.setupFailed err.botErrorMessage)
                 save env ev ctx {state = Idle}
                 pure Nothing
-              Right auth -> do
+              Right authResult -> do
+                -- The one point segment/displayName are ever knowable (see
+                -- Types.hs's AuthResult doc). A returning, named person gets a
+                -- one-time "welcome back" here — flow-agnostic (no booking
+                -- wire strings), so every flow that calls ensureAuth gets this
+                -- for free, not just the booking flow.
+                let auth = authResult.auth
+                case (authResult.segment, authResult.displayName) of
+                  (ExistingApp, Just name) -> reply env to (s.welcomeBack name)
+                  _ -> pure ()
                 ctx2 <- hook auth (ctx {personId = Just auth.personId} :: FlowContext)
                 env.persons.setPerson uk StoredPerson {personId = auth.personId, language = ctx2.language}
                 save env ev ctx2
@@ -207,7 +223,7 @@ ensureAuth env ev hook ctx = do
 replyWithMenu :: Monad m => BotEnv m -> InboundEvent -> (LanguageStrings -> m [OutButton]) -> Text -> m ()
 replyWithMenu env ev mkRow prefix = do
   mctx <- getCtx env ev
-  let s = t (mctx >>= (\c -> c.language))
+  let s = t env.cfg.translations (mctx >>= (\c -> c.language))
   row <- mkRow s
   replyButtons env (ev.fromPhone) (prefix <> s.whatToDo) row
 

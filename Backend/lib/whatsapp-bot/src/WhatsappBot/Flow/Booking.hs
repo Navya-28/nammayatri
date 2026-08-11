@@ -54,6 +54,7 @@ module WhatsappBot.Flow.Booking
 where
 
 import Control.Applicative ((<|>))
+import qualified Data.Map.Strict as Map
 import qualified Data.Text as T
 import Data.Time (addUTCTime)
 import Kernel.Prelude
@@ -99,7 +100,7 @@ promptForBookingEntry env ev ctx = do
 -- the taps.
 sendRideTypePrompt :: Monad m => BotEnv m -> InboundEvent -> FlowContext -> m ()
 sendRideTypePrompt env ev ctx = do
-  let s = t ctx.language
+  let s = t env.cfg.translations ctx.language
       to = ev.fromPhone
   save env ev (ctx {rideType = Nothing} :: FlowContext)
   replyButtons env to s.rideTypePrompt [btn s.rideTypeFlexi "ride_type:flexi", btn s.rideTypeRegular "ride_type:regular"]
@@ -147,11 +148,11 @@ prefetchSavedLocations env auth ctx = do
 promptForPickup :: Monad m => BotEnv m -> InboundEvent -> FlowContext -> Bool -> m ()
 promptForPickup env ev ctx suppressFare = do
   let merchant = env.cfg.merchant
-      s = t ctx.language
+      s = t env.cfg.translations ctx.language
       to = ev.fromPhone
   save env ev ctx {state = AwaitingPickup}
   let showFare = not suppressFare && ctx.rideType /= Just Regular
-      fareLine = if showFare then flexiFareLine merchant ctx.language else Nothing
+      fareLine = if showFare then flexiFareLine env.cfg.translations merchant ctx.language else Nothing
       body = maybe s.flexiSharePrompt (\f -> s.flexiSharePrompt <> "\n\n" <> f) fareLine
   locationRequest env to body
 
@@ -165,7 +166,7 @@ handlePickup env ev ctx = case ev.kind of
 handlePickupPin :: Monad m => BotEnv m -> InboundEvent -> FlowContext -> Double -> Double -> Maybe Text -> Maybe Text -> m ()
 handlePickupPin env ev ctx lat lon mName mAddr = do
   let merchant = env.cfg.merchant
-      s = t ctx.language
+      s = t env.cfg.translations ctx.language
       to = ev.fromPhone
   -- Serviceability geofence on the RAW pin (engine.ts:961-980), BEFORE auth/search.
   case merchant.flexiServiceArea of
@@ -203,7 +204,7 @@ handlePickupPin env ev ctx lat lon mName mAddr = do
 -- a distinct warning that it may not be the live spot.
 sendPickupConfirm :: Monad m => BotEnv m -> InboundEvent -> FlowContext -> Maybe Text -> m ()
 sendPickupConfirm env ev ctx mNamedPlace = do
-  let s = t ctx.language
+  let s = t env.cfg.translations ctx.language
       to = ev.fromPhone
   save env ev ctx {state = ConfirmingPickup}
   let areaMaybe = ctx.origin >>= (\o -> o.address.area)
@@ -247,13 +248,13 @@ data PollOutcome
 startFlexiSearch :: Monad m => BotEnv m -> InboundEvent -> FlowContext -> m ()
 startFlexiSearch env ev ctx = do
   let merchant = env.cfg.merchant
-      s = t ctx.language
+      s = t env.cfg.translations ctx.language
       to = ev.fromPhone
   case (ctx.personId, ctx.origin) of
     (Just pid, Just origin) -> do
       let auth = BotAuth pid
       save env ev ctx {state = FlexiSearching, cancelRequested = Just False}
-      let fareLine = flexiFareLine merchant ctx.language
+      let fareLine = flexiFareLine env.cfg.translations merchant ctx.language
           findingBody = maybe s.flexiFinding (\f -> s.flexiFinding <> "\n" <> f) fareLine
       replyButtons env to findingBody [btn s.flexiCancelSearch "cancel"]
       -- Reference time BEFORE the search (minus skew) so the booking clears listV2.
@@ -333,7 +334,7 @@ pollFlexiDriver env ev auth bookingId lang attempt
               pure (PollFound b)
           _ -> do
             when (attempt > 0 && attempt `mod` env.cfg.driverPollNotifyEvery == 0) $
-              reply env (ev.fromPhone) ((t lang).flexiStillFinding (fmtInt (((attempt + 1) * env.cfg.driverPollIntervalMs) `div` 1000)))
+              reply env (ev.fromPhone) ((t env.cfg.translations lang).flexiStillFinding (fmtInt (((attempt + 1) * env.cfg.driverPollIntervalMs) `div` 1000)))
             env.clock.sleepMs env.cfg.driverPollIntervalMs
             pollFlexiDriver env ev auth bookingId lang (attempt + 1)
 
@@ -347,7 +348,7 @@ pollFlexiDriver env ev auth bookingId lang attempt
 -- name is what the @*.ts:NNN@ citations resolve against.
 flexiNoAuto :: Monad m => BotEnv m -> InboundEvent -> FlowContext -> m ()
 flexiNoAuto env ev ctx = do
-  let s = t ctx.language
+  let s = t env.cfg.translations ctx.language
       to = ev.fromPhone
   save env ev ctx {state = Idle}
   replyButtons env to s.flexiNoAuto [btn s.flexiTryAgain "book"]
@@ -358,7 +359,7 @@ sendFlexiDriverCard :: Monad m => BotEnv m -> InboundEvent -> BotBookingDetails 
 sendFlexiDriverCard env ev booking = do
   mctx <- getCtx env ev
   let lang = mctx >>= (\c -> c.language)
-      card = buildDriverCard booking lang
+      card = buildDriverCard env.cfg.translations booking lang
   replyButtons env (ev.fromPhone) card.bmText card.bmButtons
 
 -- ---------------------------------------------------------------------------
@@ -368,7 +369,7 @@ sendFlexiDriverCard env ev booking = do
 -- | After pickup is confirmed, ask for the drop (@engine.ts:735-748@).
 promptForRegularDrop :: Monad m => BotEnv m -> InboundEvent -> FlowContext -> m ()
 promptForRegularDrop env ev ctx = do
-  let s = t ctx.language
+  let s = t env.cfg.translations ctx.language
       to = ev.fromPhone
   save env ev ctx {state = AwaitingRegularDrop}
   locationRequest env to s.regularDropPrompt
@@ -377,7 +378,7 @@ promptForRegularDrop env ev ctx = do
 -- disambiguate) — then price the one-way auto (@engine.ts:752-783@).
 handleRegularDrop :: Monad m => BotEnv m -> InboundEvent -> FlowContext -> Text -> m ()
 handleRegularDrop env ev ctx input = do
-  let s = t ctx.language
+  let s = t env.cfg.translations ctx.language
       to = ev.fromPhone
   case (ctx.personId, ctx.origin) of
     (Just pid, Just _origin) -> do
@@ -406,7 +407,7 @@ handleRegularDrop env ev ctx input = do
 -- | Rider picked a searched drop option (or typed a new address) (@engine.ts:786-803@).
 handleConfirmingRegularDrop :: Monad m => BotEnv m -> InboundEvent -> FlowContext -> Text -> m ()
 handleConfirmingRegularDrop env ev ctx input = do
-  let s = t ctx.language
+  let s = t env.cfg.translations ctx.language
       to = ev.fromPhone
   if "regdrop:" `T.isPrefixOf` input
     then case ctx.personId of
@@ -423,7 +424,7 @@ handleConfirmingRegularDrop env ev ctx input = do
 -- fare confirmation (@engine.ts:807-842@).
 startRegularSearch :: Monad m => BotEnv m -> InboundEvent -> FlowContext -> m ()
 startRegularSearch env ev ctx = do
-  let s = t ctx.language
+  let s = t env.cfg.translations ctx.language
       to = ev.fromPhone
   case (ctx.personId, ctx.origin, ctx.destination) of
     (Just pid, Just origin, Just destination) -> do
@@ -461,7 +462,7 @@ pollEstimates env auth searchId attempt
 -- | Show the auto fare + [Book / Change drop] (@engine.ts:845-857@).
 sendRegularFareConfirm :: Monad m => BotEnv m -> InboundEvent -> FlowContext -> m ()
 sendRegularFareConfirm env ev ctx = do
-  let s = t ctx.language
+  let s = t env.cfg.translations ctx.language
       to = ev.fromPhone
   save env ev ctx {state = ConfirmingRegularFare}
   let area = firstNonEmpty [ctx.destination >>= (\d -> d.address.area), formatAddress <$> ctx.destination] "your destination"
@@ -475,7 +476,7 @@ sendRegularFareConfirm env ev ctx = do
 -- register with the tracker (@engine.ts:861-919@).
 confirmRegularBooking :: Monad m => BotEnv m -> InboundEvent -> FlowContext -> m ()
 confirmRegularBooking env ev ctx = do
-  let s = t ctx.language
+  let s = t env.cfg.translations ctx.language
       to = ev.fromPhone
   case (ctx.personId, ctx.regularEstimateId) of
     (Just pid, Just estimateId) -> do
@@ -527,7 +528,7 @@ pollRegularBooking env ev auth createdAfter lang attempt
             pure (PollFound b)
           [] -> do
             when (attempt > 0 && attempt `mod` env.cfg.driverPollNotifyEvery == 0) $
-              reply env (ev.fromPhone) ((t lang).flexiStillFinding (fmtInt (((attempt + 1) * env.cfg.driverPollIntervalMs) `div` 1000)))
+              reply env (ev.fromPhone) ((t env.cfg.translations lang).flexiStillFinding (fmtInt (((attempt + 1) * env.cfg.driverPollIntervalMs) `div` 1000)))
             env.clock.sleepMs env.cfg.driverPollIntervalMs
             pollRegularBooking env ev auth createdAfter lang (attempt + 1)
 
@@ -539,7 +540,7 @@ pollRegularBooking env ev auth createdAfter lang attempt
 -- demand, with a path-injection guard + registry ownership check (IDOR defense).
 handleFlexiEndOtp :: Monad m => BotEnv m -> InboundEvent -> FlowContext -> Text -> m ()
 handleFlexiEndOtp env ev ctx bid = do
-  let s = t ctx.language
+  let s = t env.cfg.translations ctx.language
       to = ev.fromPhone
       uk = mkUserKey env.cfg.merchant ev
   if isNothing ctx.personId || not (isValidBookingId bid)
@@ -613,9 +614,9 @@ emptyAddress :: BotAddress
 emptyAddress = BotAddress {area = Nothing, building = Nothing, city = Nothing, country = Nothing, state = Nothing, street = Nothing}
 
 -- | The metered-tariff display line, or Nothing when unset (@engine.ts:571-579@).
-flexiFareLine :: MerchantCtx -> Maybe SupportedLanguage -> Maybe Text
-flexiFareLine merchant lang = case (merchant.flexiBaseFare, merchant.flexiPerKm) of
-  (Just base, Just perKm) -> Just ((t lang).flexiFareRate (fmtNum base) (fmtNum perKm))
+flexiFareLine :: Map.Map SupportedLanguage LanguageStrings -> MerchantCtx -> Maybe SupportedLanguage -> Maybe Text
+flexiFareLine translations merchant lang = case (merchant.flexiBaseFare, merchant.flexiPerKm) of
+  (Just base, Just perKm) -> Just ((t translations lang).flexiFareRate (fmtNum base) (fmtNum perKm))
   _ -> Nothing
 
 -- | Autocomplete search center for a destination search (@engine.ts:1660-1672@):

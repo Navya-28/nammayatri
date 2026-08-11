@@ -105,7 +105,7 @@ handleMessage env ev = do
 runEngine :: Monad m => BotEnv m -> InboundEvent -> FlowContext -> m ()
 runEngine env ev ctx = do
   let to = ev.fromPhone
-      s = t ctx.language
+      s = t env.cfg.translations ctx.language
       input = T.strip (rawInput ev)
       lower = T.toLower input
   if
@@ -165,7 +165,7 @@ runEngine env ev ctx = do
 stateSwitch :: Monad m => BotEnv m -> InboundEvent -> FlowContext -> Text -> m ()
 stateSwitch env ev ctx input =
   let to = ev.fromPhone
-      s = t ctx.language
+      s = t env.cfg.translations ctx.language
    in case ctx.state of
         Idle -> handleIdle env ev ctx input
         ChoosingLanguage -> handleChooseLanguage env ev ctx input
@@ -184,17 +184,30 @@ stateSwitch env ev ctx input =
 -- IDLE (engine.ts:498-531)
 -- ---------------------------------------------------------------------------
 
--- | @handleIdle@ (@engine.ts:498-531@). Non-book input → intro (once) + welcome
--- menu; a book trigger with no auth → silent onboarding then booking entry.
+-- | @handleIdle@ (@engine.ts:498-531@). Non-book input → silent auth (welcome-back
+-- only, no booking side effects) + intro (once) + welcome menu; a book trigger
+-- with no auth → silent onboarding then booking entry.
 handleIdle :: Monad m => BotEnv m -> InboundEvent -> FlowContext -> Text -> m ()
 handleIdle env ev ctx input = do
-  let s = t ctx.language
-      to = ev.fromPhone
+  let to = ev.fromPhone
   if not (any (`T.isInfixOf` T.toLower input) bookTriggers)
     then do
-      sendOnboardingIntroOnce env ev ctx
-      row <- menuRow env ev s
-      replyButtons env to s.welcome row
+      -- Resolve identity even on a bare greeting, so a returning known user
+      -- gets "welcome back" without having to type "book" first — but skip
+      -- the booking-entry hook (prefetchSavedLocations) since this branch
+      -- only ever shows the menu. Already-authenticated sessions (personId
+      -- set) skip straight through, same as ensureAuth's own fast path, so
+      -- this never re-resolves auth or repeats the welcome-back mid-session.
+      mctx <- case ctx.personId of
+        Just _ -> pure (Just ctx)
+        Nothing -> ensureAuth env ev (\_ c -> pure c) ctx
+      case mctx of
+        Nothing -> pure () -- ensureAuth already replied (session expired) and saved Idle
+        Just ctx' -> do
+          let s' = t env.cfg.translations ctx'.language
+          sendOnboardingIntroOnce env ev ctx'
+          row <- menuRow env ev s'
+          replyButtons env to s'.welcome row
     else case ctx.personId of
       Nothing -> do
         let ctx1 = if ctx.pendingAction == Just PendingStatus then ctx else ctx {pendingAction = Just PendingBook}
@@ -227,14 +240,14 @@ handleLang env ev ctx code = case parseLanguage code of
     case ctx.personId of
       Just pid -> env.persons.setPerson uk StoredPerson {personId = pid, language = Just l}
       Nothing -> pure ()
-    let newS = t (Just l)
+    let newS = t env.cfg.translations (Just l)
     row <- menuRow env ev newS
     replyButtons env to (newS.languageUpdated newS.nativeLanguageName <> newS.whatToDo) row
 
 -- | @choose_language@ / @more_languages@ (@engine.ts:533-563@).
 handleChooseLanguage :: Monad m => BotEnv m -> InboundEvent -> FlowContext -> Text -> m ()
 handleChooseLanguage env ev ctx input = do
-  let s = t ctx.language
+  let s = t env.cfg.translations ctx.language
       to = ev.fromPhone
   if
       | input == "choose_language" -> do
@@ -266,7 +279,7 @@ isLangCode c = not (T.null c) && T.all isWordChar c
 -- | "More options" submenu (@engine.ts:365-375@).
 handleMore :: Monad m => BotEnv m -> InboundEvent -> FlowContext -> m ()
 handleMore env ev ctx = do
-  let s = t ctx.language
+  let s = t env.cfg.translations ctx.language
       to = ev.fromPhone
       merchant = env.cfg.merchant
       items =
@@ -278,14 +291,14 @@ handleMore env ev ctx = do
 handleHelp :: Monad m => BotEnv m -> InboundEvent -> FlowContext -> m ()
 handleHelp env ev ctx = do
   sendHowItWorks env ev ctx
-  let s = t ctx.language
+  let s = t env.cfg.translations ctx.language
   row <- menuRow env ev s
   replyButtons env (ev.fromPhone) s.moreTitle row
 
 -- | Support contact (@engine.ts:381-387@), then loop to menu.
 handleSupport :: Monad m => BotEnv m -> InboundEvent -> FlowContext -> m ()
 handleSupport env ev ctx = do
-  let s = t ctx.language
+  let s = t env.cfg.translations ctx.language
       to = ev.fromPhone
       raw = fromMaybe "" env.cfg.merchant.flexiSupportPhone
       dial = fromMaybe raw (formatDialable (Just raw))
@@ -310,7 +323,7 @@ sendOnboardingIntroOnce env ev ctx = do
 -- | Send the configured intro video, if any (@engine.ts:1557-1565@).
 sendIntroVideo :: Monad m => BotEnv m -> InboundEvent -> FlowContext -> m ()
 sendIntroVideo env ev ctx = do
-  let s = t ctx.language
+  let s = t env.cfg.translations ctx.language
       to = ev.fromPhone
   case env.cfg.merchant.flexiIntroVideoUrl of
     Just url -> void $ env.sender.sendVideo to url (Just s.howItWorksCaption)
@@ -320,7 +333,7 @@ sendIntroVideo env ev ctx = do
 sendHowItWorks :: Monad m => BotEnv m -> InboundEvent -> FlowContext -> m ()
 sendHowItWorks env ev ctx = do
   sendIntroVideo env ev ctx
-  reply env (ev.fromPhone) ((t ctx.language).howItWorksText)
+  reply env (ev.fromPhone) ((t env.cfg.translations ctx.language).howItWorksText)
 
 -- ---------------------------------------------------------------------------
 -- Small pure/effect helpers

@@ -9,6 +9,14 @@
 # global secret, one merchant only) with a DB table keyed by phoneNumberId,
 # so multiple Meta Apps/phone numbers with different App Secrets can coexist
 # without a redeploy.
+#
+# tableName is meta_config, not meta_webhook_config: this table now holds
+# BOTH the inbound webhook-verification secrets (appSecret/verifyToken) AND
+# the outbound send credentials (accessToken/baseUrl/apiVersion, moved here
+# from merchant_service_config's Meta_CloudApi row) — "webhook config" only
+# described the inbound half. The Haskell type/module name stays
+# MetaWebhookConfig (avoids an import-site rename across ~8 files for a
+# cosmetic difference); only the physical table name changed.
 
 imports:
   Merchant: Domain.Types.Merchant
@@ -20,12 +28,12 @@ imports:
   MetaBotCfg: Domain.Types.Extra.MetaWebhookConfig
 
 MetaWebhookConfig:
-  tableName: meta_webhook_config
-  # No ToSchema: appSecret/verifyToken are EncryptedField 'AsEncrypted Text
-  # (= Encrypted Text), which has no ToSchema instance (only ToJSON/FromJSON
-  # via newtype-deriving) — same reason bbps_config.bbpsSignatureKey's table
-  # derives only bare "Generic". We DO need ToJSON/FromJSON (unlike BBPSConfig)
-  # since this table is cached in Redis on the hot inbound-webhook path.
+  tableName: meta_config
+  # No ToSchema: appSecret/verifyToken/accessToken are EncryptedField
+  # 'AsEncrypted Text (= Encrypted Text), which has no ToSchema instance (only
+  # ToJSON/FromJSON via newtype-deriving) — same reason bbps_config.bbpsSignatureKey's
+  # table derives only bare "Generic". We DO need ToJSON/FromJSON (unlike
+  # BBPSConfig) since this table is cached in Redis on the hot inbound-webhook path.
   derives: "Generic, Show, ToJSON, FromJSON"
 
   fields:
@@ -37,6 +45,19 @@ MetaWebhookConfig:
     # bbps_config.bbpsSignatureKey pattern.
     appSecret: EncryptedField 'AsEncrypted Text
     verifyToken: EncryptedField 'AsEncrypted Text
+    # Outbound send credentials (moved here from merchant_service_config's
+    # Meta_CloudApi row — this table already carries the phoneNumberId/
+    # merchantId/merchantOperatingCityId keys either lookup direction needs,
+    # so the two tables no longer have to agree on phoneNumberId at runtime).
+    # Backfilled + tightened to NOT NULL in
+    # dev/feature-migrations/0047-meta-config-access-token-backfill.sql +
+    # dev/ddl-migrations/rider-app/1562-meta-config-access-token-not-null.sql.
+    accessToken: EncryptedField 'AsEncrypted Text
+    # Not secrets — plain text, unlike accessToken/appSecret/verifyToken.
+    # baseUrl parses to Servant's BaseUrl via Kernel.Prelude.parseBaseUrl at
+    # the Tools/Meta.hs boundary.
+    baseUrl: Text
+    apiVersion: Text
     merchantId: Id Merchant
     merchantOperatingCityId: Id MerchantOperatingCity
     # botConfig is stored as JSONB; domain layer sees the MetaBotCfg record.
@@ -51,16 +72,19 @@ MetaWebhookConfig:
   beamType:
     appSecret: Text
     verifyToken: Text
+    accessToken: Text
     botConfig: Value
 
   sqlType:
     appSecret: text
     verifyToken: text
+    accessToken: text
     botConfig: jsonb
 
   fromTType:
     appSecret: Encrypted appSecret|E
     verifyToken: Encrypted verifyToken|E
+    accessToken: Encrypted accessToken|E
     # |M (not |E): botConfig is a required (non-Maybe) field, so the decode
     # needs a monadic fromMaybeM-guarded transformer (see
     # Storage/Queries/Transformers/MetaWebhookConfig.hs's readBotConfig),
@@ -71,7 +95,17 @@ MetaWebhookConfig:
   toTType:
     appSecret: appSecret & unEncrypted|E
     verifyToken: verifyToken & unEncrypted|E
+    accessToken: accessToken & unEncrypted|E
     botConfig: Data.Aeson.toJSON botConfig|E
+
+  # Only used by the generated rollup SQL (migrations-read-only) when adding
+  # these NOT NULL columns to a table that could already have rows — never
+  # applies to a genuinely fresh table, and never surfaces at the app level
+  # since every real row gets a real value via the app's own insert path.
+  default:
+    accessToken: "''"
+    baseUrl: "''"
+    apiVersion: "''"
 
   constraints:
     id: PrimaryKey

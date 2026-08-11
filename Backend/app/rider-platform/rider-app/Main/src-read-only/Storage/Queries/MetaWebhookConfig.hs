@@ -37,7 +37,10 @@ updateByPrimaryKey :: (EsqDBFlow m r, MonadFlow m, CacheFlow m r) => (Domain.Typ
 updateByPrimaryKey (Domain.Types.MetaWebhookConfig.MetaWebhookConfig {..}) = do
   _now <- getCurrentTime
   updateWithKV
-    [ Se.Set Beam.appSecret (appSecret & unEncrypted),
+    [ Se.Set Beam.accessToken (accessToken & unEncrypted),
+      Se.Set Beam.apiVersion apiVersion,
+      Se.Set Beam.appSecret (appSecret & unEncrypted),
+      Se.Set Beam.baseUrl baseUrl,
       Se.Set Beam.botConfig (Data.Aeson.toJSON botConfig),
       Se.Set Beam.enabled enabled,
       Se.Set Beam.merchantId (Kernel.Types.Id.getId merchantId),

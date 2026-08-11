@@ -23,6 +23,7 @@ module WhatsappBot.Adapter.Env
   )
 where
 
+import qualified Data.Map.Strict as Map
 import qualified Data.Text as T
 import qualified Domain.Types.Merchant as DM
 import qualified Domain.Types.MerchantOperatingCity as DMOC
@@ -30,7 +31,7 @@ import qualified Domain.Types.MetaWebhookConfig as DMWC
 import Environment
 import Kernel.Prelude
 import Kernel.Types.Id (Id)
-import Kernel.Utils.Common (fromMaybeM, getCurrentTime, logError, logWarning)
+import Kernel.Utils.Common (fromMaybeM, getCurrentTime, logError)
 import qualified Storage.CachedQueries.Merchant as QMerchant
 import qualified Storage.CachedQueries.Merchant.MerchantOperatingCity as CQMOC
 import Tools.Error
@@ -40,11 +41,12 @@ import WhatsappBot.Adapter.PersonStore (mkPersonStore)
 import WhatsappBot.Adapter.Registry (mkRideRegistry)
 import WhatsappBot.Adapter.Sender (mkWaSender)
 import WhatsappBot.Adapter.SessionStore (mkSessionStore)
+import WhatsappBot.Adapter.Translations (getTranslationsMap)
 import WhatsappBot.Engine (handleMessage)
 import WhatsappBot.Env (BotConfig (..), BotEnv (..))
 import WhatsappBot.Handles (Clock (..), RideRegistry (..))
 import qualified WhatsappBot.I18n as WI
-import WhatsappBot.I18n.Types ()
+import WhatsappBot.I18n.Types (LanguageStrings, SupportedLanguage)
 import WhatsappBot.Tracker (TrackerDeps (..))
 import WhatsappBot.Types (InboundEvent (..), MerchantCtx (..), RideMode (..))
 
@@ -93,8 +95,8 @@ mkClock :: Clock Flow
 mkClock = Clock {now = getCurrentTime, sleepMs = \n -> threadDelay (n * 1000)}
 
 -- | Poll constants are TS-hardcoded (L11); allowlist comes from app-env.
-mkBotConfig :: MerchantCtx -> [Text] -> BotConfig
-mkBotConfig ctx allowed =
+mkBotConfig :: MerchantCtx -> [Text] -> Map.Map SupportedLanguage LanguageStrings -> BotConfig
+mkBotConfig ctx allowed translations =
   BotConfig
     { allowedPhones = allowed,
       merchant = ctx,
@@ -104,21 +106,19 @@ mkBotConfig ctx allowed =
       regularEstimatePollIntervalMs = 2000,
       driverPollAttempts = 90,
       driverPollIntervalMs = 2000,
-      driverPollNotifyEvery = 15
+      driverPollNotifyEvery = 15,
+      translations = translations
     }
 
 -- | Assemble the full engine environment for one inbound (used by the webhook).
 buildBotEnv :: DMWC.MetaWebhookConfig -> Flow (BotEnv Flow)
 buildBotEnv cfg = do
   (merchantId, mocId, ctx) <- resolveMerchant cfg
-  metaCfg <- lookupMetaCfg merchantId mocId
-  -- Drift guard: the phone_number_id lives in both the MSC row (outbound) and the
-  -- meta_webhook_config row (inbound key); they must agree or replies go to the wrong number.
-  when (metaCfg.phoneNumberId /= cfg.phoneNumberId) $
-    logWarning $ "Meta phone_number_id mismatch: MSC=" <> metaCfg.phoneNumberId <> " MetaWebhookConfig=" <> cfg.phoneNumberId
+  metaCfg <- lookupMetaCfg cfg
   allowed <- asks (.metaAllowedPhones)
   sessTtl <- asks (.metaSessionTtlSec)
   trackMaxAge <- asks (.metaTrackerMaxAgeSec)
+  translations <- getTranslationsMap mocId
   pure
     BotEnv
       { backend = mkBackendHandle merchantId mocId ctx,
@@ -127,7 +127,7 @@ buildBotEnv cfg = do
         persons = mkPersonStore,
         registry = mkRideRegistry trackMaxAge,
         clock = mkClock,
-        cfg = mkBotConfig ctx allowed
+        cfg = mkBotConfig ctx allowed translations
       }
 
 -- | Run one inbound message through the golden-tested engine with the prod env.
@@ -144,7 +144,7 @@ dispatchInbound cfg ev = do
       handleMessage botEnv ev
         `catch` \(e :: SomeException) -> do
           logError $ "whatsapp dispatch: engine crashed: " <> show e
-          let msg = (WI.t Nothing).somethingWentWrong
+          let msg = (WI.t botEnv.cfg.translations Nothing).somethingWentWrong
           void $ botEnv.sender.sendText ev.fromPhone msg
 
 -- | Per-merchant tracker deps: the registry's @listRides@ is scoped to THIS
@@ -152,7 +152,7 @@ dispatchInbound cfg ev = do
 -- the sender/backend are this merchant's. Correct for the 1-merchant pilot.
 -- MULTI-MERCHANT CAVEAT (L6, deferred): a ride is matched to its merchant by
 -- @merchantLabel@ ONLY, so merchantLabels MUST be globally unique across all
--- enabled @meta_webhook_config@ rows (this constraint became MORE important,
+-- enabled @meta_config@ rows (this constraint became MORE important,
 -- not less, now that multiple Meta Apps/rows are the whole point — not
 -- enforced anywhere yet) — a collision would let one merchant's tick push
 -- another merchant's ride from the wrong WhatsApp number. The multi-tenant
@@ -161,9 +161,10 @@ dispatchInbound cfg ev = do
 buildTrackerDeps :: DMWC.MetaWebhookConfig -> Flow (TrackerDeps Flow)
 buildTrackerDeps cfg = do
   (merchantId, mocId, ctx) <- resolveMerchant cfg
-  metaCfg <- lookupMetaCfg merchantId mocId
+  metaCfg <- lookupMetaCfg cfg
   sessTtl <- asks (.metaSessionTtlSec)
   trackMaxAge <- asks (.metaTrackerMaxAgeSec)
+  translations <- getTranslationsMap mocId
   let fullRegistry = mkRideRegistry trackMaxAge
       scopedRegistry = fullRegistry {listRides = filter (\r -> r.merchantLabel == ctx.merchantLabel) <$> fullRegistry.listRides}
       backend = mkBackendHandle merchantId mocId ctx
@@ -173,5 +174,6 @@ buildTrackerDeps cfg = do
         tdGetBookingDetails = backend.getBookingDetails,
         tdSender = mkWaSender metaCfg,
         tdSessions = mkSessionStore sessTtl,
-        tdClock = mkClock
+        tdClock = mkClock,
+        tdTranslations = translations
       }

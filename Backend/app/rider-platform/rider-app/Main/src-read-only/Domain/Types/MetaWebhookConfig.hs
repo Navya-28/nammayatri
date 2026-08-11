@@ -15,7 +15,10 @@ import qualified Kernel.Types.Id
 import qualified Tools.Beam.UtilsTH
 
 data MetaWebhookConfig = MetaWebhookConfig
-  { appSecret :: Kernel.External.Encryption.EncryptedField 'Kernel.External.Encryption.AsEncrypted Kernel.Prelude.Text,
+  { accessToken :: Kernel.External.Encryption.EncryptedField 'Kernel.External.Encryption.AsEncrypted Kernel.Prelude.Text,
+    apiVersion :: Kernel.Prelude.Text,
+    appSecret :: Kernel.External.Encryption.EncryptedField 'Kernel.External.Encryption.AsEncrypted Kernel.Prelude.Text,
+    baseUrl :: Kernel.Prelude.Text,
     botConfig :: Domain.Types.Extra.MetaWebhookConfig.MetaBotCfg,
     createdAt :: Kernel.Prelude.UTCTime,
     enabled :: Kernel.Prelude.Bool,

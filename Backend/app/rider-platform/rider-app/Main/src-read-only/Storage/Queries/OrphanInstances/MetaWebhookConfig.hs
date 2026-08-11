@@ -20,7 +20,10 @@ instance FromTType' Beam.MetaWebhookConfig Domain.Types.MetaWebhookConfig.MetaWe
     pure $
       Just
         Domain.Types.MetaWebhookConfig.MetaWebhookConfig
-          { appSecret = Encrypted appSecret,
+          { accessToken = Encrypted accessToken,
+            apiVersion = apiVersion,
+            appSecret = Encrypted appSecret,
+            baseUrl = baseUrl,
             botConfig = botConfig',
             createdAt = createdAt,
             enabled = enabled,
@@ -35,7 +38,10 @@ instance FromTType' Beam.MetaWebhookConfig Domain.Types.MetaWebhookConfig.MetaWe
 instance ToTType' Beam.MetaWebhookConfig Domain.Types.MetaWebhookConfig.MetaWebhookConfig where
   toTType' (Domain.Types.MetaWebhookConfig.MetaWebhookConfig {..}) = do
     Beam.MetaWebhookConfigT
-      { Beam.appSecret = appSecret & unEncrypted,
+      { Beam.accessToken = accessToken & unEncrypted,
+        Beam.apiVersion = apiVersion,
+        Beam.appSecret = appSecret & unEncrypted,
+        Beam.baseUrl = baseUrl,
         Beam.botConfig = Data.Aeson.toJSON botConfig,
         Beam.createdAt = createdAt,
         Beam.enabled = enabled,

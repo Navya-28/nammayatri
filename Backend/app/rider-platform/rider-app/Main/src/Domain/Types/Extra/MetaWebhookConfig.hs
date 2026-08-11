@@ -13,7 +13,7 @@
 -}
 
 -- | Per-phone-number WhatsApp-bot tuning config, persisted as the @bot_config@
--- jsonb column of @meta_webhook_config@. Field-for-field copy of the old
+-- jsonb column of @meta_config@. Field-for-field copy of the old
 -- Dhall-sourced @Environment.MetaBotCfg@, with an Aeson codec instead of
 -- @FromDhall@ (this JSON only ever round-trips through our own DB column,
 -- never the Meta wire format, so no key remapping is needed here).

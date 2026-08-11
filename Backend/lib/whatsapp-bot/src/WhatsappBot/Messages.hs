@@ -18,9 +18,10 @@ module WhatsappBot.Messages
 where
 
 import Data.Char (isDigit)
+import qualified Data.Map.Strict as Map
 import qualified Data.Text as T
 import Kernel.Prelude
-import WhatsappBot.I18n (SupportedLanguage, t)
+import WhatsappBot.I18n (LanguageStrings, SupportedLanguage, t)
 -- Instances only: LanguageStrings is dot-accessed via RDP (getField), so its
 -- name/selectors are never referenced directly, but the HasField instances are
 -- needed. (Importing the names triggers -Wunused-imports under -Werror.)
@@ -88,14 +89,14 @@ formatDialable (Just phone)
     d = T.filter isDigit phone
 
 -- | The "auto found — driver on the way" card (@flexi-messages.ts:62-87@).
-buildDriverCard :: BotBookingDetails -> Maybe SupportedLanguage -> BuiltMessage
-buildDriverCard b lang =
+buildDriverCard :: Map.Map SupportedLanguage LanguageStrings -> BotBookingDetails -> Maybe SupportedLanguage -> BuiltMessage
+buildDriverCard translations b lang =
   BuiltMessage
     { bmText = T.intercalate "\n" msgLines,
       bmButtons = [OutButton {btnId = "cancel_confirm:" <> b.bookingId, btnTitle = s.cancelRide, btnDesc = Nothing}]
     }
   where
-    s = t lang
+    s = t translations lang
     driverName = fromMaybe "" b.driverName
     dial = formatDialable b.driverNumber
     msgLines =
@@ -108,16 +109,16 @@ buildDriverCard b lang =
 
 -- | Driver reached the pickup point; re-share the start OTP if present
 -- (@flexi-messages.ts:90-95@). @flexiArrived@ branches internally on empty OTP.
-buildArrived :: BotBookingDetails -> Maybe SupportedLanguage -> BuiltMessage
-buildArrived b lang =
+buildArrived :: Map.Map SupportedLanguage LanguageStrings -> BotBookingDetails -> Maybe SupportedLanguage -> BuiltMessage
+buildArrived translations b lang =
   BuiltMessage {bmText = s.flexiArrived (fromMaybe "" b.rideOtp), bmButtons = []}
   where
-    s = t lang
+    s = t translations lang
 
 -- | Start-OTP entered — trip underway (@flexi-messages.ts:99-110@). The End-ride
 -- button is rental-only, gated on the end OTP's presence.
-buildStarted :: BotBookingDetails -> Maybe SupportedLanguage -> BuiltMessage
-buildStarted b lang
+buildStarted :: Map.Map SupportedLanguage LanguageStrings -> BotBookingDetails -> Maybe SupportedLanguage -> BuiltMessage
+buildStarted translations b lang
   | isJust b.endOtp =
     BuiltMessage
       { bmText = s.flexiRideStarted,
@@ -125,18 +126,18 @@ buildStarted b lang
       }
   | otherwise = BuiltMessage {bmText = s.rideStartedSimple, bmButtons = []}
   where
-    s = t lang
+    s = t translations lang
 
 -- | Ride completed — surface the real final fare + distance when available
 -- (@flexi-messages.ts:113-128@). meters -> km rounded to 1dp.
-buildEnded :: BotBookingDetails -> Maybe SupportedLanguage -> BuiltMessage
-buildEnded b lang =
+buildEnded :: Map.Map SupportedLanguage LanguageStrings -> BotBookingDetails -> Maybe SupportedLanguage -> BuiltMessage
+buildEnded translations b lang =
   BuiltMessage
     { bmText = s.flexiRideEnded fareLine,
       bmButtons = [OutButton {btnId = "book", btnTitle = s.flexiBookAnother, btnDesc = Nothing}]
     }
   where
-    s = t lang
+    s = t translations lang
     -- JS Math.round is round-half-UP (Math.round 12.5 == 13); Haskell `round` is
     -- banker's rounding, so use floor(x + 0.5) to match (distances are >= 0).
     km = fmap (\d -> fromIntegral (floor (d / 100 + 0.5) :: Integer) / 10 :: Double) b.chargeableDistanceM
@@ -145,11 +146,11 @@ buildEnded b lang =
       Nothing -> s.flexiFareUnavailable
 
 -- | Ride cancelled (@flexi-messages.ts:131-137@).
-buildCancelled :: Maybe SupportedLanguage -> BuiltMessage
-buildCancelled lang =
+buildCancelled :: Map.Map SupportedLanguage LanguageStrings -> Maybe SupportedLanguage -> BuiltMessage
+buildCancelled translations lang =
   BuiltMessage
     { bmText = s.flexiRideCancelled,
       bmButtons = [OutButton {btnId = "book", btnTitle = s.flexiBookAnother, btnDesc = Nothing}]
     }
   where
-    s = t lang
+    s = t translations lang

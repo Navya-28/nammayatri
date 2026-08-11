@@ -15,8 +15,8 @@
 -- | Inbound Meta WhatsApp Cloud API webhook handler. GET = verification
 -- handshake; POST = ack-fast delivery (peek phoneNumberId → look up
 -- MetaWebhookConfig → decrypt → verify signature → decode → dedupe → fork).
--- Per-phone-number App Secret/Verify Token/merchant routing now live in the
--- @meta_webhook_config@ DB table (Storage.CachedQueries.MetaWebhookConfig),
+-- Per-phone-number App Secret/Verify Token/Access Token/merchant routing now
+-- live in the @meta_config@ DB table (Storage.CachedQueries.MetaWebhookConfig),
 -- not Dhall — multiple Meta Apps/phone numbers can each have their own
 -- secret. See the peek-before-verify precedent in
 -- provider-platform/.../Tools/SignatureAuth.hs for the general shape.
