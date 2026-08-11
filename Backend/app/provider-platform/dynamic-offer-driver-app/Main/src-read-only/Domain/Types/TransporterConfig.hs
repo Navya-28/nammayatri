@@ -51,6 +51,7 @@ data TransporterConfig = TransporterConfig
     allowGstReupload :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
     allowInvalidRcDeletionOnReplacement :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
     allowMultiFleetOperatorLink :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    allowNonFleetDriverLiveMap :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
     allowPanAadhaarLinkage :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
     allowPanReupload :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
     allowRcUnlinkWhenDriverOffline :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
@@ -245,7 +246,6 @@ data TransporterConfig = TransporterConfig
     minThresholdForPassThroughDestination :: Kernel.Prelude.Maybe Kernel.Types.Common.Meters,
     minmRentalAndScheduledBookingLeadTimeHours :: Kernel.Types.Common.Hours,
     missingMappingFallbackVariant :: Kernel.Prelude.Maybe Domain.Types.VehicleVariant.VehicleVariant,
-    allowNonFleetDriverLiveMap :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
     nightSafetyEndTime :: Kernel.Types.Common.Seconds,
     nightSafetyRouteDeviationThreshold :: Kernel.Types.Common.Meters,
     nightSafetyStartTime :: Kernel.Types.Common.Seconds,
@@ -449,7 +449,8 @@ data DriverWalletConfig = DriverWalletConfig
     minimumWalletPayoutAmount :: Kernel.Types.Common.HighPrecMoney,
     onlineCommissionPaidOutDirectly :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
     payoutCutOffDays :: Kernel.Prelude.Int,
-    payoutFee :: Kernel.Prelude.Maybe Domain.Types.TransporterConfig.PayoutFeeConfig
+    payoutFee :: Kernel.Prelude.Maybe Domain.Types.TransporterConfig.PayoutFeeConfig,
+    requireBapSettlementConfirmation :: Kernel.Prelude.Maybe Kernel.Prelude.Bool
   }
   deriving (Generic, Show, ToJSON, FromJSON, Read, Eq)
 
