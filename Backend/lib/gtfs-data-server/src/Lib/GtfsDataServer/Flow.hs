@@ -1,5 +1,6 @@
 module Lib.GtfsDataServer.Flow where
 
+import qualified Data.Text as T
 import Kernel.Prelude
 import Kernel.Tools.Metrics.CoreMetrics (CoreMetrics)
 import Kernel.Types.Error
@@ -53,6 +54,15 @@ gimsCurrentOperation :: (CoreMetrics m, MonadFlow m, MonadReader r m, HasShortDu
 gimsCurrentOperation baseUrl gtfsId req =
   withShortRetry $ callAPI baseUrl (NandiAPI.postOperatorCurrentOperation gtfsId req) "gimsCurrentOperation" NandiAPI.operatorCurrentOperationAPI >>= fromEitherM (ExternalAPICallError (Just "UNABLE_TO_CALL_GIMS_CURRENT_OPERATION_API") baseUrl)
 
+gimsCurrentOperationMaybe :: (CoreMetrics m, MonadFlow m, MonadReader r m, HasShortDurationRetryCfg r c, HasRequestId r) => BaseUrl -> Text -> GimsOperationAnchor -> m (Maybe GimsCurrentOperationResp)
+gimsCurrentOperationMaybe baseUrl gtfsId req =
+  withShortRetry $
+    callAPI baseUrl (NandiAPI.postOperatorCurrentOperation gtfsId req) "gimsCurrentOperation" NandiAPI.operatorCurrentOperationAPI >>= \case
+      Right resp -> pure (Just resp)
+      Left err -> do
+        logError $ "GIMS currentOperation returned no active session: " <> show err
+        pure Nothing
+
 gimsTripAction :: (CoreMetrics m, MonadFlow m, MonadReader r m, HasShortDurationRetryCfg r c, HasRequestId r) => BaseUrl -> Text -> GimsTripActionReq -> m Value
 gimsTripAction baseUrl gtfsId req =
   withShortRetry $ callAPI baseUrl (NandiAPI.postOperatorTripAction gtfsId req) "gimsTripAction" NandiAPI.operatorTripActionAPI >>= fromEitherM (ExternalAPICallError (Just "UNABLE_TO_CALL_GIMS_TRIP_ACTION_API") baseUrl)
@@ -81,3 +91,35 @@ getStopCode baseUrl gtfsId providerStopCode =
 gimsVerifyConductor :: (CoreMetrics m, MonadFlow m, MonadReader r m, HasShortDurationRetryCfg r c, HasRequestId r) => BaseUrl -> Text -> GimsVerifyReq -> m GimsVerifyResp
 gimsVerifyConductor baseUrl gtfsId req =
   withShortRetry $ callAPI baseUrl (NandiAPI.postOperatorVerify gtfsId req) "gimsVerifyConductor" NandiAPI.operatorVerifyAPI >>= fromEitherM (ExternalAPICallError (Just "UNABLE_TO_CALL_GIMS_VERIFY_CONDUCTOR_API") baseUrl)
+
+defaultQueryLimit :: Int
+defaultQueryLimit = 100
+
+maxQueryLimit :: Int
+maxQueryLimit = 1000
+
+operatorQueryRows :: (CoreMetrics m, MonadFlow m, MonadReader r m, HasShortDurationRetryCfg r c, HasRequestId r) => BaseUrl -> Text -> NandiTable -> QueryBody -> m [NandiRow]
+operatorQueryRows baseUrl gtfsId table body = do
+  forM_ body.filters $ \f -> do
+    when (T.null f.column) $
+      throwError . InvalidRequest $ "Filter column name must not be empty"
+    unless (T.all (\c -> c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '_') f.column) $
+      throwError . InvalidRequest $ "Invalid filter column name: " <> f.column
+  whenJust body.offset $ \o ->
+    when (o < 0) $ throwError . InvalidRequest $ "offset must not be negative"
+  cappedLimit <- case body.limit of
+    Nothing -> pure defaultQueryLimit
+    Just l
+      | l <= 0 -> throwError . InvalidRequest $ "limit must be positive"
+      | otherwise -> pure (min maxQueryLimit l)
+  let cappedBody = body {limit = Just cappedLimit}
+  vals <-
+    withShortRetry $
+      callAPI baseUrl (NandiAPI.postOperatorQueryRows gtfsId (nandiTableToText table) cappedBody) "operatorQueryRows" NandiAPI.operatorQueryRowsAPI
+        >>= fromEitherM (ExternalAPICallError (Just "UNABLE_TO_CALL_OPERATOR_QUERY_ROWS_API") baseUrl)
+  forM vals $ \v ->
+    case decodeNandiRow table v of
+      Right row -> pure row
+      Left err -> do
+        logError $ "Failed to decode NandiRow for table " <> nandiTableToText table <> ": " <> T.pack err
+        throwError . InternalError $ "Failed to decode GIMS response for table " <> nandiTableToText table

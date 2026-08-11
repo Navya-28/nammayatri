@@ -71,6 +71,8 @@ dependencies:
   - bytestring
   - containers
   - unordered-containers
+  - lens
+  - http-api-data
 
 ghc-options:
   - -fwrite-ide-info

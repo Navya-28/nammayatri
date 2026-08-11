@@ -63,6 +63,7 @@ dependencies:
   - base >= 4.7 && < 5
   - mobility-core
   - beckn-spec
+  - gtfs-data-server
   - bytestring
   - record-dot-preprocessor
   - record-hasfield

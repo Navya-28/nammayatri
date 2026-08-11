@@ -116,3 +116,17 @@ getNandiStopCode = ET.client stopCodeAPI
 
 postOperatorVerify :: Text -> GimsVerifyReq -> ET.EulerClient GimsVerifyResp
 postOperatorVerify = ET.client operatorVerifyAPI
+
+type OperatorQueryRowsAPI =
+  "internal" :> "operator" :> Capture "gtfs_id" Text
+    :> "crud"
+    :> Capture "table" Text
+    :> "query"
+    :> ReqBody '[JSON] QueryBody
+    :> Post '[JSON] [Value]
+
+operatorQueryRowsAPI :: Proxy OperatorQueryRowsAPI
+operatorQueryRowsAPI = Proxy
+
+postOperatorQueryRows :: Text -> Text -> QueryBody -> ET.EulerClient [Value]
+postOperatorQueryRows = ET.client operatorQueryRowsAPI

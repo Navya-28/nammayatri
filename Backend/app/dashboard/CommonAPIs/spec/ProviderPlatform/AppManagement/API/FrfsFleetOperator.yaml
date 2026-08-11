@@ -1,0 +1,56 @@
+imports:
+  VehicleCategory: BecknV2.OnDemand.Enums
+  NandiTable: Lib.GtfsDataServer.Types
+  NandiRow: Lib.GtfsDataServer.Types
+  QueryBody: Lib.GtfsDataServer.Types
+  FleetOperatorCurrentOperationReq: API.Types.UI.FRFSFleetOperator
+  FleetOperatorCurrentOperationResp: API.Types.UI.FRFSFleetOperator
+  FleetOperatorTripActionReq: API.Types.UI.FRFSFleetOperator
+  FleetOperatorTripActionResp: API.Types.UI.FRFSFleetOperator
+
+importPackageOverrides:
+  API.Types.UI.FRFSFleetOperator: "dynamic-offer-driver-app"
+  Lib.GtfsDataServer.Types: "gtfs-data-server"
+  BecknV2.OnDemand.Enums: "beckn-spec"
+
+module: FrfsFleetOperator
+apiPrefix: FrfsFleetOperator
+
+apis:
+  - POST:
+      endpoint: /queryRow
+      name: PostFrfsFleetOperatorQueryRow
+      auth: ApiAuthV2
+      mandatoryQuery:
+        - vehicleCategory: VehicleCategory
+        - table: NandiTable
+      request:
+        type: QueryBody
+      response:
+        type: "[NandiRow]"
+      migrate:
+        capability: transit-operations.master.read
+
+  - POST:
+      endpoint: /currentOperation
+      name: PostFrfsFleetOperatorCurrentOperation
+      auth: ApiAuthV2
+      request:
+        type: FleetOperatorCurrentOperationReq
+      response:
+        type: FleetOperatorCurrentOperationResp
+      migrate:
+        capability: transit-operations.trip.execute
+
+  - POST:
+      endpoint: /tripAction
+      name: PostFrfsFleetOperatorTripAction
+      auth: ApiAuthV2
+      request:
+        type: FleetOperatorTripActionReq
+      response:
+        type: FleetOperatorTripActionResp
+      migrate:
+        capability: transit-operations.trip.execute
+
+types: {}

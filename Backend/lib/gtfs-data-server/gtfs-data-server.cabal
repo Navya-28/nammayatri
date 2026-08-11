@@ -80,8 +80,10 @@ library
     , containers
     , euler-hs
     , exceptions
+    , http-api-data
     , http-client
     , http-types
+    , lens
     , mobility-core
     , openapi3
     , record-dot-preprocessor

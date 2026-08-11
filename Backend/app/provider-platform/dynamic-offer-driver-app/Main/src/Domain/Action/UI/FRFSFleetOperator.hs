@@ -28,7 +28,7 @@ import qualified Kernel.Types.Beckn.Context
 import Kernel.Types.Common (Seconds (..))
 import Kernel.Types.Id (Id (..), getId)
 import Kernel.Types.TimeBound (TimeBound (..))
-import Kernel.Utils.Common (fork, fromMaybeM, getCurrentTime, logError, logInfo, throwError)
+import Kernel.Utils.Common (fork, fromMaybeM, generateGUID, getCurrentTime, logError, logInfo, throwError)
 import qualified Lib.GtfsDataServer.Flow as NandiFlow
 import Lib.GtfsDataServer.Types
 import SharedLogic.CallBAPInternal (getFrfsTripManifest, notifyFrfsTripStarted)
@@ -215,18 +215,20 @@ postFrfsFleetOperatorTripAction ::
   )
 postFrfsFleetOperatorTripAction (_, _merchantId, merchantOpCityId) req = do
   let FleetOperatorTripActionReq {action = act} = req
-  integratedBPPConfig <-
-    findFirstIbppConfigByCityAndVehicle
-      merchantOpCityId
-      (show BUS)
-  baseUrl <- getGimsBaseUrl integratedBPPConfig
-  let gtfsId = DIBC.feedKey integratedBPPConfig
       anchor =
         GimsOperationAnchor
           { gimsConductorId = req.gimsConductorId,
             gimsDriverId = req.gimsDriverId,
             vehicleNumber = req.vehicleNumber
           }
+  when (isNothing anchor.gimsConductorId && isNothing anchor.gimsDriverId && isNothing anchor.vehicleNumber) $
+    throwError $ InvalidRequest "At least one of gimsConductorId, gimsDriverId, vehicleNumber must be provided"
+  integratedBPPConfig <-
+    findFirstIbppConfigByCityAndVehicle
+      merchantOpCityId
+      (show BUS)
+  baseUrl <- getGimsBaseUrl integratedBPPConfig
+  let gtfsId = DIBC.feedKey integratedBPPConfig
   gimsOps <- NandiFlow.gimsCurrentOperation baseUrl gtfsId anchor
   let GimsCurrentOperationResp {waybill_no = wbNo, number_of_trips = numTrips, trip_numbers = mbTripNums} = gimsOps
       -- Real (non-dead / non-inactive) trip_numbers in order, e.g. [1,3,4,6,7]. GIMS already
@@ -246,20 +248,14 @@ postFrfsFleetOperatorTripAction (_, _merchantId, merchantOpCityId) req = do
   where
     handleTripStart baseUrl gtfsId anchor tripNums redisKey epochNow wbNo = do
       let lockKey = redisKey <> ":lock"
-      lockAcquired <- Hedis.setNxExpire lockKey 30 ("1" :: Text)
-      unless lockAcquired $ do
-        logError $ "FRFSFleetOperator: Could not acquire lock for trip start - " <> redisKey
-        throwError $ InvalidRequest "Could not acquire lock for trip action"
-      mbCurrentTrip <- Hedis.get redisKey
-      let currentTrip = fromMaybe 0 (mbCurrentTrip :: Maybe Int)
-      -- Next real trip_number strictly after the current one (dead trips are absent from tripNums).
-      case listToMaybe (filter (> currentTrip) tripNums) of
-        Nothing -> do
-          void $ Hedis.del lockKey
-          throwError $ InvalidRequest "No more trips available for this waybill"
-        Just nextTrip -> do
-          let GimsOperationAnchor {gimsConductorId = ct, gimsDriverId = dt, vehicleNumber = vn} = anchor
-          flip finally (void $ Hedis.del lockKey) $ do
+      withActionLock lockKey $ do
+        mbCurrentTrip <- Hedis.get redisKey
+        let currentTrip = fromMaybe 0 (mbCurrentTrip :: Maybe Int)
+        -- Next real trip_number strictly after the current one (dead trips are absent from tripNums).
+        case find (> currentTrip) tripNums of
+          Nothing -> throwError $ InvalidRequest "No more trips available for this waybill"
+          Just nextTrip -> do
+            let GimsOperationAnchor {gimsConductorId = ct, gimsDriverId = dt, vehicleNumber = vn} = anchor
             void $
               NandiFlow.gimsTripAction
                 baseUrl
@@ -289,17 +285,12 @@ postFrfsFleetOperatorTripAction (_, _merchantId, merchantOpCityId) req = do
 
     handleTripEnd baseUrl gtfsId anchor redisKey tripNums = do
       let lockKey = redisKey <> ":lock"
-      lockAcquired <- Hedis.setNxExpire lockKey 30 ("1" :: Text)
-      unless lockAcquired $ do
-        logError $ "FRFSFleetOperator: Could not acquire lock for trip end - " <> redisKey
-        throwError $ InvalidRequest "Could not acquire lock for trip action"
-      mbCurrentTrip <- Hedis.get redisKey
-      let currentTrip = fromMaybe 0 (mbCurrentTrip :: Maybe Int)
-      when (currentTrip == 0) $ do
-        void $ Hedis.del lockKey
-        throwError $ InvalidRequest "No active trip to end"
-      let GimsOperationAnchor {gimsConductorId = ct, gimsDriverId = dt, vehicleNumber = vn} = anchor
-      flip finally (void $ Hedis.del lockKey) $ do
+      withActionLock lockKey $ do
+        mbCurrentTrip <- Hedis.get redisKey
+        let currentTrip = fromMaybe 0 (mbCurrentTrip :: Maybe Int)
+        when (currentTrip == 0) $
+          throwError $ InvalidRequest "No active trip to end"
+        let GimsOperationAnchor {gimsConductorId = ct, gimsDriverId = dt, vehicleNumber = vn} = anchor
         void $
           NandiFlow.gimsTripAction
             baseUrl
@@ -312,6 +303,7 @@ postFrfsFleetOperatorTripAction (_, _merchantId, merchantOpCityId) req = do
                 gimsDriverId = dt,
                 vehicleNumber = vn
               }
+        Hedis.setExp redisKey currentTrip 172800
         logInfo $ "FRFSFleetOperator: Trip end successful - trip " <> show currentTrip
         return $
           FleetOperatorTripActionResp
@@ -321,12 +313,8 @@ postFrfsFleetOperatorTripAction (_, _merchantId, merchantOpCityId) req = do
 
     handleTripReset baseUrl gtfsId anchor redisKey tripNums = do
       let lockKey = redisKey <> ":lock"
-      lockAcquired <- Hedis.setNxExpire lockKey 30 ("1" :: Text)
-      unless lockAcquired $ do
-        logError $ "FRFSFleetOperator: Could not acquire lock for trip reset - " <> redisKey
-        throwError $ InvalidRequest "Could not acquire lock for trip action"
-      let GimsOperationAnchor {gimsConductorId = ct, gimsDriverId = dt, vehicleNumber = vn} = anchor
-      flip finally (void $ Hedis.del lockKey) $ do
+      withActionLock lockKey $ do
+        let GimsOperationAnchor {gimsConductorId = ct, gimsDriverId = dt, vehicleNumber = vn} = anchor
         void $
           NandiFlow.gimsTripAction
             baseUrl
@@ -348,20 +336,14 @@ postFrfsFleetOperatorTripAction (_, _merchantId, merchantOpCityId) req = do
 
     handleTripRollback baseUrl gtfsId anchor redisKey epochNow tripNums = do
       let lockKey = redisKey <> ":lock"
-      lockAcquired <- Hedis.setNxExpire lockKey 30 ("1" :: Text)
-      unless lockAcquired $ do
-        logError $ "FRFSFleetOperator: Could not acquire lock for trip rollback - " <> redisKey
-        throwError $ InvalidRequest "Could not acquire lock for trip action"
-      mbCurrentTrip <- Hedis.get redisKey
-      let currentTrip = fromMaybe 0 (mbCurrentTrip :: Maybe Int)
-      -- Previous real trip_number strictly before the current one (largest tripNum < currentTrip).
-      case listToMaybe (reverse (filter (< currentTrip) tripNums)) of
-        Nothing -> do
-          void $ Hedis.del lockKey
-          throwError $ InvalidRequest "No trip to rollback"
-        Just rolledBackTrip -> do
-          let GimsOperationAnchor {gimsConductorId = ct, gimsDriverId = dt, vehicleNumber = vn} = anchor
-          flip finally (void $ Hedis.del lockKey) $ do
+      withActionLock lockKey $ do
+        mbCurrentTrip <- Hedis.get redisKey
+        let currentTrip = fromMaybe 0 (mbCurrentTrip :: Maybe Int)
+        -- Previous real trip_number strictly before the current one (largest tripNum < currentTrip).
+        case find (< currentTrip) (reverse tripNums) of
+          Nothing -> throwError $ InvalidRequest "No trip to rollback"
+          Just rolledBackTrip -> do
+            let GimsOperationAnchor {gimsConductorId = ct, gimsDriverId = dt, vehicleNumber = vn} = anchor
             void $
               NandiFlow.gimsTripAction
                 baseUrl
@@ -382,6 +364,20 @@ postFrfsFleetOperatorTripAction (_, _merchantId, merchantOpCityId) req = do
                   hasUpcomingTrips = not (null (filter (> rolledBackTrip) tripNums))
                 }
 
+    withActionLock :: Text -> Flow FleetOperatorTripActionResp -> Flow FleetOperatorTripActionResp
+    withActionLock lockKey action = do
+      lockToken <- generateGUID
+      lockAcquired <- Hedis.setNxExpire lockKey 30 lockToken
+      unless lockAcquired $ do
+        logError $ "FRFSFleetOperator: Could not acquire lock - " <> lockKey
+        throwError $ InvalidRequest "Could not acquire lock for trip action"
+      flip finally (releaseLockIfOwner lockKey lockToken) action
+
+    releaseLockIfOwner :: Text -> Text -> Flow ()
+    releaseLockIfOwner key token = do
+      mbOwner <- (Hedis.get key :: Flow (Maybe Text))
+      when (mbOwner == Just token) $ void $ Hedis.del key
+
 -- | Get current operation details
 postFrfsFleetOperatorCurrentOperation ::
   ( ( Maybe (Id Domain.Types.Person.Person),
@@ -393,19 +389,23 @@ postFrfsFleetOperatorCurrentOperation ::
   )
 postFrfsFleetOperatorCurrentOperation (_, _merchantId, merchantOpCityId) req = do
   logInfo "FRFSFleetOperator: Current operation"
+  let anchor =
+        GimsOperationAnchor
+          { gimsConductorId = req.gimsConductorId,
+            gimsDriverId = req.gimsDriverId,
+            vehicleNumber = req.vehicleNumber
+          }
+  when (isNothing anchor.gimsConductorId && isNothing anchor.gimsDriverId && isNothing anchor.vehicleNumber) $
+    throwError $ InvalidRequest "At least one of gimsConductorId, gimsDriverId, vehicleNumber must be provided"
   integratedBPPConfig <-
     findFirstIbppConfigByCityAndVehicle
       merchantOpCityId
       (show BUS)
   baseUrl <- getGimsBaseUrl integratedBPPConfig
   let gtfsId = DIBC.feedKey integratedBPPConfig
-      anchor =
-        GimsOperationAnchor
-          { gimsConductorId = req.gimsConductorId,
-            gimsDriverId = req.gimsDriverId,
-            vehicleNumber = req.vehicleNumber
-          }
-  gimsOps <- NandiFlow.gimsCurrentOperation baseUrl gtfsId anchor
+  gimsOps <-
+    NandiFlow.gimsCurrentOperationMaybe baseUrl gtfsId anchor
+      >>= fromMaybeM (InvalidRequest "No active duty session found for the provided identifier")
   let configId = getId integratedBPPConfig.id
       redisKey = configId <> ":" <> gimsOps.waybill_no <> ":tripnumber"
   mbPrevTrip <- Hedis.get redisKey
