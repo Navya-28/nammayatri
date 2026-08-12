@@ -1,5 +1,6 @@
 module Domain.Action.UI.FRFSTicketService where
 
+import qualified API.Types.UI.FRFSInternal as FRFSInternal
 import API.Types.UI.FRFSTicketService
 import qualified API.Types.UI.FRFSTicketService as FRFSTicketService
 import qualified API.Types.UI.MultimodalConfirm
@@ -1748,6 +1749,53 @@ notifyBusTripStartedForTrip tripId = do
             -- Sends push (primary) + opt-in WhatsApp (secondary), both handled inside notifyBusTripStarted.
             -- The WhatsApp `trip_tracking_enabled` template carries a static deep link, so no URL variable is passed.
             Notifications.notifyBusTripStarted person vehicleNo routeName tripId mbJourneyId
+
+-- | Notify passengers booked from a specific stop that their bus is approaching (relaxed/nearing
+-- distance thresholds). Driven by gps-processor, which already computes distance/ETA per stop and
+-- calls this over the internal API (see FRFSInternal) once per threshold crossing per stop.
+notifyBusApproachingStopForTrip :: Text -> Text -> FRFSInternal.NotifyBusApproachingReq -> Environment.Flow ()
+notifyBusApproachingStopForTrip tripId stopCode req = do
+  bookings <- QFRFSTicketBooking.findAllConfirmedByTripId tripId
+  let stopBookings = filter (\b -> b.fromStationCode == stopCode) bookings
+  unless (null stopBookings) $ do
+    let riderIds = map (.riderId) stopBookings
+    persons <- QP.findAllByIds riderIds
+    let personMap = Map.fromList $ map (\p -> (p.id, p)) persons
+    legs <- QJourneyLeg.findAllByLegSearchIds (map (\b -> b.searchId.getId) stopBookings)
+    let legMap = Map.fromList $ mapMaybe (\l -> (,l) <$> l.legSearchId) legs
+        notificationKey = case req.thresholdType of
+          "nearing" -> "BUS_APPROACHING_300M"
+          _ -> "BUS_APPROACHING_1KM"
+    -- Route number (e.g. "570P", "18A") and vehicle tag number are display-only niceties for the
+    -- push body — resolved once off any one booking's config, not per booking, since they're the
+    -- same route/vehicle for the whole event. routeNumber is the route's GTFS shortName, distinct
+    -- from booking.routeCode (the internal route id) and booking.routeName ("<fromStop> - <toStop>").
+    (routeNumber, mbVehicleTagNumber) <- case stopBookings of
+      (sampleBooking : _) -> do
+        integratedBPPConfig <- SIBC.findIntegratedBPPConfigFromEntity sampleBooking
+        mbRoute <- OTPRest.getRouteByRouteId integratedBPPConfig req.routeId
+        mbVehicleMetadata <- JMU.getVehicleMetadataFromInMem [integratedBPPConfig] req.vehicleNumber
+        pure (maybe "" (.shortName) mbRoute, mbVehicleMetadata >>= (\(_, metadata) -> metadata.busTagNumber))
+      [] -> pure ("", Nothing)
+    forM_ stopBookings $ \booking -> do
+      let mbJourneyLeg = Map.lookup booking.searchId.getId legMap
+          mbJourneyId = (.journeyId) <$> mbJourneyLeg
+      case Map.lookup booking.riderId personMap of
+        Nothing -> pure ()
+        Just person -> do
+          -- Only notify for tiers whitelisted per city (RiderConfig.busApproachingNotificationTiers)
+          mbRiderConfig <- getConfig (RiderConfigDimensions {merchantOperatingCityId = person.merchantOperatingCityId.getId}) Nothing
+          let allowedTiers = fromMaybe [] (mbRiderConfig >>= (.busApproachingNotificationTiers))
+              isAllowedTier = maybe False (`elem` allowedTiers) booking.serviceTierType
+          when isAllowedTier $ do
+            -- routeName in the booking is inconsistently stored as "X To Y" or "X - Y" — normalize
+            -- to the dash form for a consistent push body regardless of which format this booking
+            -- happened to be created with.
+            let routeName = Data.Text.replace " To " " - " (fromMaybe "" booking.routeName)
+                vehicleNo = fromMaybe "" booking.vehicleNumber
+                stopName = fromMaybe "-" booking.fromStationName
+            logInfo $ "Notifying passenger " <> person.id.getId <> " that bus is " <> req.thresholdType <> " stop " <> stopCode <> " on trip " <> tripId
+            Notifications.notifyBusApproachingStop person vehicleNo routeName routeNumber mbVehicleTagNumber tripId stopCode stopName notificationKey mbJourneyId (Just booking.id.getId)
 
 postFrfsFleetOperatorCurrentOperation ::
   ( Kernel.Prelude.Maybe (Kernel.Types.Id.Id Domain.Types.Person.Person),

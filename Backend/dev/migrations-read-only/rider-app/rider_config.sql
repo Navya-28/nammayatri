@@ -795,3 +795,9 @@ ALTER TABLE atlas_app.rider_config ADD COLUMN enable_share_number_with_driver bo
 ------- SQL updates -------
 
 ALTER TABLE atlas_app.rider_config ADD COLUMN pass_extra_config json ;
+
+
+
+------- SQL updates -------
+
+ALTER TABLE atlas_app.rider_config ADD COLUMN bus_approaching_notification_tiers text [] ;

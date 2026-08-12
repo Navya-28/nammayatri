@@ -2085,6 +2085,63 @@ notifyBusTripStarted person vehicleNumber routeName tripId mbJourneyId = do
   -- The `trip_tracking_enabled` template carries a static deep link, so no variables are passed.
   sendWhatsAppTemplateIfOptedIn person DMM.WHATSAPP_BUS_TRIP_STARTED []
 
+data BusApproachingParam = BusApproachingParam
+  { vehicleNumber :: Text,
+    routeName :: Text,
+    routeNumber :: Text,
+    vehicleTagNumber :: Maybe Text,
+    stopName :: Text
+  }
+  deriving (Show, Eq, Generic, ToJSON, FromJSON)
+
+-- | Notify a passenger booked from `stopCode` that their bus is approaching that stop.
+-- `notificationKey` picks the merchant_push_notification row (distinct copy per distance
+-- threshold, e.g. "BUS_APPROACHING_1KM" / "BUS_APPROACHING_300M"); the notification `Category`
+-- (Approaching) stays the same for both. `stopName` is the passenger's booked/source stop.
+-- The push body shows `routeNumber` (e.g. "P570") + `vehicleTagNumber` (if available) instead of
+-- the raw fleet/vehicle number — `vehicleNumber`/`routeName` are still carried in the entity data
+-- for deep-linking, just not shown in the display text.
+notifyBusApproachingStop ::
+  ServiceFlow m r =>
+  Person.Person ->
+  Text ->
+  Text ->
+  Text ->
+  Maybe Text ->
+  Text ->
+  Text ->
+  Text ->
+  Text ->
+  Maybe (Id Domain.Types.Journey.Journey) ->
+  Maybe Text ->
+  m ()
+notifyBusApproachingStop person vehicleNumber routeName routeNumber vehicleTagNumber tripId stopCode stopName notificationKey mbJourneyId mbBookingId = do
+  let entityData =
+        BusNotificationEntityData
+          { tripId = Just tripId,
+            vehicleNumber = vehicleNumber,
+            routeId = routeName,
+            stopCode = Just stopCode,
+            stopName = Just stopName,
+            notificationType = APPROACHING,
+            journeyId = mbJourneyId <&> (.getId),
+            bookingId = mbBookingId
+          }
+  let entity = Notification.Entity Notification.Product person.id.getId entityData
+      dynamicParams = BusApproachingParam vehicleNumber routeName routeNumber vehicleTagNumber stopName
+      routeDisplay = case vehicleTagNumber of
+        Just tag | not (T.null tag) -> routeNumber <> " (" <> tag <> ")"
+        _ -> routeNumber
+  dynamicNotifyPerson
+    person
+    (createNotificationReq notificationKey (\r -> r {notificationTypeForSound = Just Notification.TRIP_UPDATED}))
+    dynamicParams
+    entity
+    Nothing
+    [("routeDisplay", routeDisplay), ("routeName", routeName), ("stopName", stopName)]
+    Nothing
+    Nothing
+
 -- | Notify a passenger that the operator changed the driver and/or the assigned bus for their upcoming
 -- FRFS bus trip (waybill-details update). Push-only. A single notification covers both fields; the
 -- `updatedField` template variable carries the three-way wording (driver details / bus number / both) so
