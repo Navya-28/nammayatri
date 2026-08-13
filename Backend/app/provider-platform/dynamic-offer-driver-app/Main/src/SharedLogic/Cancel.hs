@@ -147,7 +147,9 @@ reAllocateBookingIfPossible isValueAddNP userReallocationEnabled merchant bookin
       searchTry <- QST.findLastByRequestId quote.searchRequestId >>= fromMaybeM (SearchTryNotFound quote.searchRequestId.getId)
       transporterConfig <- getOneConfig (TransporterConfigDimensions {merchantOperatingCityId = booking.merchantOperatingCityId.getId}) Nothing >>= fromMaybeM (TransporterConfigNotFound booking.merchantOperatingCityId.getId)
       isRepeatSearch <- checkIfRepeatSearch searchTry ride.driverArrivalTime searchReq.isReallocationEnabled now searchReq.isScheduled transporterConfig
-      if isRepeatSearch || isForceReallocation
+      let searchRepeatLimit = if searchReq.isScheduled then transporterConfig.scheduledRideSearchRepeatLimit else transporterConfig.searchRepeatLimit
+          underRepeatCap = searchTry.searchRepeatCounter < searchRepeatLimit
+      if isRepeatSearch || (isForceReallocation && underRepeatCap)
         then performStaticOfferReallocation quote searchReq searchTry transporterConfig now isRepeatSearch
         else cancelRideTransactionForNonReallocation Nothing Nothing
 
@@ -174,20 +176,24 @@ reAllocateBookingIfPossible isValueAddNP userReallocationEnabled merchant bookin
                 businessEmailDomain = searchTry.businessEmailDomain,
                 driverPreference = searchTry.driverPreference
               }
-      handleDriverSearchBatch driverSearchBatchInput booking searchTry.estimateId False
+      handleDriverSearchBatch driverSearchBatchInput booking searchTry.estimateId False False
 
     performStaticOfferReallocation quote searchReq searchTry transporterConfig now isRepeatSearch = do
       let searchBlacklistTtl = fromMaybe 3600 transporterConfig.driverSearchBlacklistDurationSeconds
       DP.addDriverToSearchCancelledList searchBlacklistTtl searchReq.id ride.driverId
       (newBooking, newQuote) <- createNewBookingAndQuote quote transporterConfig now searchReq
+      let singleBooking = transporterConfig.enableBppReallocation == Just True
+          targetBooking = if singleBooking then booking{quoteId = newQuote.id.getId, status = SRB.NEW, isScheduled = newBooking.isScheduled, startTime = newBooking.startTime, updatedAt = now} else newBooking
       let mbDriverExtraFeeBounds = ((,) <$> searchReq.estimatedDistance <*> ((.driverExtraFeeBounds) =<< (quote.farePolicy))) <&> uncurry DFP.findDriverExtraFeeBoundsByDistance
           driverPickUpCharge = USRD.extractDriverPickupCharges . (.farePolicyDetails) =<< (quote.farePolicy)
           driverParkingCharge = (.parkingCharge) =<< (quote.farePolicy)
       tripQuoteDetail <- buildTripQuoteDetail searchReq booking.tripCategory booking.vehicleServiceTier quote.vehicleServiceTierName booking.estimatedFare (Just booking.isDashboardRequest) (mbDriverExtraFeeBounds <&> (.minFee)) (mbDriverExtraFeeBounds <&> (.maxFee)) (mbDriverExtraFeeBounds <&> (.stepFee)) (mbDriverExtraFeeBounds <&> (.defaultStepFee)) driverPickUpCharge driverParkingCharge newQuote.id.getId [] False booking.fareParams.congestionCharge booking.fareParams.petCharges booking.fareParams.priorityCharges booking.commission booking.fareParams.tollCharges booking.fareParams.govtCharges booking.fareParams.driverCancellationNotAllowed
       void $ clearCachedFarePolicyByEstOrQuoteId booking.quoteId
       QQuote.create newQuote
-      QRB.createBooking newBooking
-      when newBooking.isScheduled $ void $ addScheduledBookingInRedis newBooking
+      if singleBooking
+        then QRB.updateReallocationReset newQuote.id.getId targetBooking.startTime targetBooking.isScheduled booking.id
+        else QRB.createBooking newBooking
+      when targetBooking.isScheduled $ void $ addScheduledBookingInRedis targetBooking
       merchantPaymentMethod <- maybe (return Nothing) QMPM.findById booking.paymentMethodId
       let paymentMethodInfo = mkPaymentMethodInfo <$> merchantPaymentMethod
       let driverSearchBatchInput =
@@ -206,20 +212,22 @@ reAllocateBookingIfPossible isValueAddNP userReallocationEnabled merchant bookin
                 businessEmailDomain = searchTry.businessEmailDomain,
                 driverPreference = searchTry.driverPreference
               }
-      handleDriverSearchBatch driverSearchBatchInput newBooking searchTry.estimateId True
+      handleDriverSearchBatch driverSearchBatchInput targetBooking searchTry.estimateId True singleBooking
 
-    handleDriverSearchBatch driverSearchBatchInput newBooking estimateId isStatic = do
+    handleDriverSearchBatch driverSearchBatchInput newBooking estimateId isStatic singleBooking = do
       result <- withTryCatch "initiateDriverSearchBatch:handleDriverSearchBatch" (initiateDriverSearchBatch driverSearchBatchInput)
       case result of
-        Right _ ->
-          if isValueAddNP
-            then do
-              if isStatic then BP.sendQuoteRepetitionUpdateToBAP booking ride newBooking.id bookingCReason.source driver vehicle else BP.sendEstimateRepetitionUpdateToBAP booking ride (Id estimateId) bookingCReason.source driver vehicle
-              -- Reallocation-success branch skips sendBookingCancelledUpdateToBAP, so cancel the old FE trip here.
-              fork "FleetEngine: cancel old trip on reallocation success" $
-                FleetEngine.notifyTripCancelled booking.merchantOperatingCityId ride.id
-              return True
-            else cancelRideTransactionForNonReallocation Nothing (Just estimateId)
+        Right _
+          | singleBooking -> do
+            BP.sendReallocationUpdateToBAP booking ride bookingCReason.source driver vehicle
+            fork "FleetEngine: cancel old trip on reallocation success" $ FleetEngine.notifyTripCancelled booking.merchantOperatingCityId ride.id
+            return True
+          | isValueAddNP -> do
+            if isStatic then BP.sendQuoteRepetitionUpdateToBAP booking ride newBooking.id bookingCReason.source driver vehicle else BP.sendEstimateRepetitionUpdateToBAP booking ride (Id estimateId) bookingCReason.source driver vehicle
+            -- reallocation success skips sendBookingCancelledUpdateToBAP, so cancel the old FleetEngine trip here (no-op for non-FE cities)
+            fork "FleetEngine: cancel old trip on reallocation success" $ FleetEngine.notifyTripCancelled booking.merchantOperatingCityId ride.id
+            return True
+          | otherwise -> cancelRideTransactionForNonReallocation Nothing (Just estimateId)
         Left _ -> cancelRideTransactionForNonReallocation Nothing (Just estimateId)
 
     createTripQuoteDetails ::
@@ -308,11 +316,12 @@ reAllocateBookingIfPossible isValueAddNP userReallocationEnabled merchant bookin
           arrivedPickupThreshold = highPrecMetersToMeters transporterConfig.arrivedPickupThreshold
           driverHasNotArrived = isNothing driverArrivalTime || maybe True (> arrivedPickupThreshold) bookingCReason.driverDistToPickup
           scheduleReallocationAllowed = transporterConfig.enableScheduleReallocation == Just True
+          bppReallocationAllowed = transporterConfig.enableBppReallocation == Just True
       return $
         searchTry.searchRepeatCounter < searchRepeatLimit
           && (bookingCReason.source == SBCR.ByDriver || (bookingCReason.source == SBCR.ByFleetOwner && scheduleReallocationAllowed) || (bookingCReason.source == SBCR.ByUser && userReallocationEnabled))
           && (isSearchTryValid || isScheduled)
-          && fromMaybe False isReallocationEnabled
+          && (bppReallocationAllowed || fromMaybe False isReallocationEnabled)
           && (driverHasNotArrived || (scheduleReallocationAllowed && booking.startTime > now))
 
     buildBookingCancellationReason newBooking = do

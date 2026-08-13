@@ -347,6 +347,26 @@ buildOnUpdateReqOrderV2 outerBooking req' mbFarePolicy becknConfig = case req' o
           orderCreatedAt = Just booking.createdAt,
           orderUpdatedAt = Just booking.updatedAt
         }
+  OU.RideBookingReallocationBuildReq OU.DBookingReallocationReq {..} -> do
+    let BookingDetails {..} = bookingDetails
+    let previousCancellationReasonsTags = UtilsOU.mkPreviousCancellationReasonsTags cancellationSource
+    fulfillment <- Utils.mkFulfillmentV2 Nothing Nothing ride booking Nothing Nothing previousCancellationReasonsTags Nothing False False Nothing (Just $ show EventEnum.RIDE_CONFIRMED) isValueAddNP Nothing False 0
+    pure $
+      Spec.Order
+        { orderId = Just booking.id.getId,
+          orderFulfillments = Just [fulfillment],
+          orderBilling = Nothing,
+          orderCancellation = Nothing,
+          orderCancellationTerms = Nothing,
+          orderItems = Nothing,
+          orderPayments = Nothing,
+          orderProvider = Nothing,
+          orderQuote = Nothing,
+          orderTags = Nothing,
+          orderStatus = Nothing,
+          orderCreatedAt = Just booking.createdAt,
+          orderUpdatedAt = Just booking.updatedAt
+        }
   OU.TollCrossedBuildReq OU.DTollCrossedBuildReq {..} -> do
     let BookingDetails {..} = bookingDetails
     fulfillment <- Utils.mkFulfillmentV2 Nothing Nothing ride booking Nothing Nothing Nothing Nothing False False Nothing (Just $ show Event.TOLL_CROSSED) isValueAddNP Nothing False 0
