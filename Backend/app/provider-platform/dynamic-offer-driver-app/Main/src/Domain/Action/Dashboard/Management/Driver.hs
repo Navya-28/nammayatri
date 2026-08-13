@@ -16,6 +16,7 @@ module Domain.Action.Dashboard.Management.Driver
   ( getDriverDocumentsInfo,
     getDriverAadhaarInfo,
     getDriverAadhaarInfobyMobileNumber,
+    getDriverLoginOtp,
     getDriverList,
     getDriverActivity,
     postDriverDisable,
@@ -119,6 +120,7 @@ import Domain.Types.MerchantMessage (MediaChannel (..), MessageKey (..))
 import qualified Domain.Types.MerchantOperatingCity as DMOC
 import qualified Domain.Types.Person as DP
 import Domain.Types.Plan
+import qualified Domain.Types.RegistrationToken as DRT
 import qualified Domain.Types.Ride as SRide
 import qualified Domain.Types.Vehicle as DVeh
 import qualified Domain.Types.VehicleCategory as DVC
@@ -318,6 +320,32 @@ getDriverAadhaarInfobyMobileNumber merchantShortId _ phoneNumber = do
             driverImage = aadhaarData.driverImage
           }
     Nothing -> throwError $ InvalidRequest "no aadhaar data is found"
+
+---------------------------------------------------------------------
+getDriverLoginOtp :: ShortId DM.Merchant -> Context.City -> Maybe Text -> Maybe Text -> Flow Common.DriverLoginOtpRes
+getDriverLoginOtp merchantShortId _ mbMobileNumber mbCountryCode = do
+  merchant <- findMerchantByShortId merchantShortId
+  mobileNumber <- fromMaybeM (InvalidRequest "mobileNumber is required") mbMobileNumber
+  let countryCode = fromMaybe "+91" mbCountryCode
+  mobileNumberHash <- getDbHash mobileNumber
+  driver <- QPerson.findByMobileNumberAndMerchantAndRole countryCode mobileNumberHash merchant.id DP.DRIVER >>= fromMaybeM (InvalidRequest "Driver not found")
+  tokens <- QR.findAllByPersonId driver.id.getId
+  now <- getCurrentTime
+  let isValid t =
+        t.authType == DRT.OTP
+          && not t.verified
+          && addUTCTime (fromIntegral (t.authExpiry * 60)) t.updatedAt > now
+      mbToken = listToMaybe . sortOn (Down . (.updatedAt)) $ filter isValid tokens
+  token <- fromMaybeM (InvalidRequest "No active login OTP for this driver") mbToken
+  logInfo $ "Dashboard ops fetched login OTP for driverId=" <> driver.id.getId <> " merchantShortId=" <> merchantShortId.getShortId
+  pure
+    Common.DriverLoginOtpRes
+      { driverId = cast driver.id,
+        otp = token.authValueHash,
+        attemptsLeft = token.attempts,
+        generatedAt = token.updatedAt,
+        expiresAt = addUTCTime (fromIntegral (token.authExpiry * 60)) token.updatedAt
+      }
 
 ---------------------------------------------------------------------
 castCommonOnboardingAsToDomain :: Common.OnboardingAs -> DrInfo.OnboardingAs
