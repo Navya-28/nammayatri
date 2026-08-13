@@ -122,6 +122,7 @@ library
       Lib.Finance.Storage.Queries.JournalEntryTransaction
       Lib.Finance.Storage.Queries.LedgerEntry
       Lib.Finance.Storage.Queries.OrphanInstances.AuditEntry
+      Lib.Finance.Storage.Queries.OrphanInstances.DirectTaxTransaction
       Lib.Finance.Storage.Queries.OrphanInstances.Invoice
       Lib.Finance.Storage.Queries.OrphanInstances.InvoiceTemplate
       Lib.Finance.Storage.Queries.OrphanInstances.JournalEntryTransaction

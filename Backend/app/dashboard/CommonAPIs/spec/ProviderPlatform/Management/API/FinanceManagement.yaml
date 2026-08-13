@@ -207,6 +207,7 @@ apis:
         batchId: Text
         belnr: Text
         glNumber: Text
+        description: Text
       auth: ApiAuthV2
       response:
         type: SapJournalListRes
@@ -221,6 +222,7 @@ apis:
         limit: Int
         offset: Int
         subscriptionId: Text
+        description: Text
       auth: ApiAuthV2
       response:
         type: SapJournalTransactionsRes
