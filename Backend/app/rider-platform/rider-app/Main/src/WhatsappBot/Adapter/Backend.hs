@@ -222,7 +222,9 @@ mkBackendHandle merchantId mocId ctx =
             DProfile.updatePerson (Id auth.personId) merchantId (updateProfileReq upd) Nothing Nothing Nothing Nothing Nothing Nothing
     }
   where
-    -- run a search' with the standard "no client version / not-dashboard" trailing args
+    -- run a search' with the standard "no client version / not-dashboard" trailing args.
+    -- The final `Just True` tags this search as WhatsApp-originated (isWhatsappRequest),
+    -- so it can be traced/counted at the source (SearchRequest.isWhatsappRequest).
     runSearch auth req =
       UISearch.search'
         (Id auth.personId, merchantId)
@@ -237,6 +239,7 @@ mkBackendHandle merchantId mocId ctx =
         Nothing
         Nothing
         Nothing
+        (Just True)
 
     placeNameReq getBy =
       Maps.GetPlaceNameReq {getBy = getBy, sessionToken = Just "default-token", language = Just Maps.ENGLISH}
