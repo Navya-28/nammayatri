@@ -99,6 +99,7 @@ import qualified SharedLogic.Merchant as SMerchant
 import qualified SharedLogic.MerchantPaymentMethod as DMPM
 import SharedLogic.Ride
 import qualified SharedLogic.RiderDetails as SRD
+import qualified SharedLogic.ScheduledBooking.WindowValidation as SWV
 import qualified SharedLogic.Type as SLT
 import qualified SharedLogic.VehicleServiceTierAreaRestriction as VSTAR
 import Storage.Beam.SpecialZone ()
@@ -978,6 +979,10 @@ validateRequest merchant sReq = do
       isReserveRide = sReq.isReserveRide
       reserveRideEstimate = sReq.reserveRideEstimate
       numberOfLuggages = sReq.numberOfLuggages
+  when possibleTripOption.isScheduled $
+    case SWV.validateScheduledBookingWindow transporterConfig.minBookingWindow transporterConfig.maxBookingWindow now sReq.pickupTime of
+      Left err -> throwError err
+      Right () -> pure ()
   whenJust numberOfLuggages $ \n ->
     when (n < 0) $ throwError (InvalidRequest "Number of luggages must be non-negative")
   whenJust numberOfLuggages $ \n ->

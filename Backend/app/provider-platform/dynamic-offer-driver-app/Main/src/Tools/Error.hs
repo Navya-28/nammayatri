@@ -38,6 +38,24 @@ instance IsAPIError RatingError
 
 instanceExceptionWithParent 'HTTPException ''RatingError
 
+data ScheduledBookingError
+  = ScheduledBookingWindowTooSoon
+  | ScheduledBookingWindowTooFarInFuture
+  deriving (Eq, Show, IsBecknAPIError)
+
+instance IsBaseError ScheduledBookingError where
+  toMessage ScheduledBookingWindowTooSoon = Just "Scheduled pickup time is earlier than the minimum advance booking window."
+  toMessage ScheduledBookingWindowTooFarInFuture = Just "Scheduled pickup time is later than the maximum advance booking window."
+
+instance IsHTTPError ScheduledBookingError where
+  toErrorCode ScheduledBookingWindowTooSoon = "SCHEDULED_BOOKING_WINDOW_TOO_SOON"
+  toErrorCode ScheduledBookingWindowTooFarInFuture = "SCHEDULED_BOOKING_WINDOW_TOO_FAR_IN_FUTURE"
+  toHttpCode _ = E400
+
+instance IsAPIError ScheduledBookingError
+
+instanceExceptionWithParent 'HTTPException ''ScheduledBookingError
+
 data LocationServiceabilityError
   = LocationUnserviceable
   deriving (Eq, Show, IsBecknAPIError)

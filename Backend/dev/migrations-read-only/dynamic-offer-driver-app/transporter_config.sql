@@ -1065,3 +1065,7 @@ ALTER TABLE atlas_driver_offer_bpp.transporter_config ADD COLUMN fleet_upi_payou
 
 ALTER TABLE atlas_driver_offer_bpp.transporter_config ADD COLUMN fleet_bank_payout_enabled boolean  default true;
 ALTER TABLE atlas_driver_offer_bpp.transporter_config ADD COLUMN pickup_stall_monitoring_config json ;
+
+------- MSIL scheduled rides (SWS-1 / SWS-2) -------
+ALTER TABLE atlas_driver_offer_bpp.transporter_config ADD COLUMN min_booking_window integer;
+ALTER TABLE atlas_driver_offer_bpp.transporter_config ADD COLUMN max_booking_window integer;
