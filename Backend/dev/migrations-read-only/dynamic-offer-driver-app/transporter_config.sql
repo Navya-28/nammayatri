@@ -1055,3 +1055,9 @@ ALTER TABLE atlas_driver_offer_bpp.transporter_config ADD COLUMN enable_downward
 ALTER TABLE atlas_driver_offer_bpp.transporter_config ADD COLUMN stripe_status_refresh_count_window json ;
 ALTER TABLE atlas_driver_offer_bpp.transporter_config ADD COLUMN stripe_status_refresh_count_threshold integer ;
 ALTER TABLE atlas_driver_offer_bpp.transporter_config ADD COLUMN pickup_stall_monitoring_config json ;
+
+
+------- SQL updates -------
+
+ALTER TABLE atlas_driver_offer_bpp.transporter_config ADD COLUMN scheduled_ride_avg_speed_kmph double precision ;
+ALTER TABLE atlas_driver_offer_bpp.transporter_config ADD COLUMN max_scheduled_holds_per_driver integer  default 1;

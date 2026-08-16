@@ -223,6 +223,8 @@ prepareDriverPoolBatch cityServiceTiers merchant driverPoolCfg searchReq searchT
               pickupLatLong = LatLong pickupLoc.lat pickupLoc.lon
               dropLocation = searchReq.toLocation <&> (\loc -> LatLong loc.lat loc.lon)
               routeDistance = searchReq.estimatedDistance
+              pickupLocation = pickupLatLong
+              estimatedDuration = searchReq.estimatedDuration
               currentSearchInfo = DTS.CurrentSearchInfo {..}
               govtCharges = listToMaybe tripQuoteDetails >>= (.govtCharges)
               tollCharges_ = listToMaybe tripQuoteDetails >>= (.tollCharges)
@@ -370,6 +372,8 @@ prepareDriverPoolBatch cityServiceTiers merchant driverPoolCfg searchReq searchT
               let pickupLatLong = LatLong pickupLoc.lat pickupLoc.lon
               let dropLocation = searchReq.toLocation <&> (\loc -> LatLong loc.lat loc.lon)
                   routeDistance = searchReq.estimatedDistance
+                  pickupLocation = pickupLatLong
+                  estimatedDuration = searchReq.estimatedDuration
               let currentSearchInfo = DTS.CurrentSearchInfo {..}
               let govtCharges = listToMaybe tripQuoteDetails >>= (.govtCharges)
                   tollCharges_ = listToMaybe tripQuoteDetails >>= (.tollCharges)
@@ -469,6 +473,8 @@ assignDriverGoHomeTags pool searchReq searchTry tripQuoteDetails driverPoolCfg m
       Just toLoc | isGoHomeAvailable searchTry.tripCategory -> do
         let dropLocation = searchReq.toLocation <&> (\loc -> LatLong loc.lat loc.lon)
             routeDistance = searchReq.estimatedDistance
+            pickupLocation = LatLong searchReq.fromLocation.lat searchReq.fromLocation.lon
+            estimatedDuration = searchReq.estimatedDuration
         let currentSearchInfo = DTS.CurrentSearchInfo {..}
         let goHomeReq =
               CalculateGoHomeDriverPoolReq

@@ -21,10 +21,12 @@ module SharedLogic.SearchTryLocker
     tryMarkBookingAssignmentInprogress,
     isBookingAssignmentInprogress,
     markBookingAssignmentCompleted,
+    driverScheduledHoldLockKey,
   )
 where
 
 import Domain.Types.Booking (Booking)
+import Domain.Types.Person (Person)
 import Domain.Types.SearchTry (SearchTry)
 import Kernel.Prelude
 import qualified Kernel.Storage.Hedis.Queries as Hedis
@@ -133,3 +135,7 @@ mkBookingCancelledKey bookingId = "Booking:Cancelled:BookingId-" <> bookingId.ge
 
 mkBookingAssignedKey :: Id Booking -> Text
 mkBookingAssignedKey bookingId = "Booking:Assigned:BookingId-" <> bookingId.getId
+
+-- serializes a driver's concurrent scheduled accepts; the per-booking lock above cannot (two bookings = two keys)
+driverScheduledHoldLockKey :: Id Person -> Text
+driverScheduledHoldLockKey driverId = "Driver:ScheduledHold:DId-" <> driverId.getId

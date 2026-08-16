@@ -75,6 +75,7 @@ import qualified SharedLogic.FareCalculator as FC
 import qualified SharedLogic.FarePolicy as SFP
 import qualified SharedLogic.IffcoTokioInsurance as IffcoInsurance
 import SharedLogic.Ride (calculateEstimatedEndTimeRange, getPayoutDetailsForRide, isKaaliPeeliBooking)
+import qualified SharedLogic.ScheduledBooking.OverlapCheck as SBOC
 import qualified SharedLogic.ScheduledNotifications as SN
 import qualified SharedLogic.SpecialZoneDriverDemand as SpecialZoneDriverDemand
 import Storage.Beam.Payment ()
@@ -248,8 +249,10 @@ startRideHandler ServiceHandle {..} rideId req = do
       whenWithLocationUpdatesLock driverId $ do
         withTimeAPI "startRide" "initializeDistanceCalculation" $ initializeDistanceCalculation updatedRide.id driverId point
         withTimeAPI "startRide" "startRideAndUpdateLocation" $ startRideAndUpdateLocation driverId updatedRide booking.id point booking.providerId odometer transporterConfig driverInfo
-        when booking.isScheduled $
-          void $ QDI.updateOnRideAndLatestScheduledBookingAndPickup True Nothing Nothing (cast driverId)
+        when booking.isScheduled $ do
+          -- ride start releases this hold: re-point the gate at the earliest remaining one (single-slot -> clear)
+          mbNextHold <- SBOC.nextScheduledHoldAfterRelease transporterConfig (cast driverId) booking.id
+          void $ QDI.updateOnRideAndLatestScheduledBookingAndPickup True (fst <$> mbNextHold) (snd <$> mbNextHold) (cast driverId)
 
       fork "notify customer for ride start" $ notifyBAPRideStarted booking updatedRide (Just point)
       fork "startRide - Notify driver" $ Notify.notifyOnRideStarted ride booking
