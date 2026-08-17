@@ -141,6 +141,8 @@ module SharedLogic.Finance.Wallet
     walletReferenceCancellationOverdueBenefitRefund,
     walletReferenceCancellationOverdueBenefitRefundTax,
     splitGrossByVatPct,
+    splitGrossByGstBreakup,
+    splitCancellationGross,
     getRedeemableEntryIds,
     settleWalletEntries,
     getPayoutEligibilityData,
@@ -411,6 +413,23 @@ splitGrossByVatPct mbPct gross = case mbPct of
       let vat = HighPrecMoney (gross.getHighPrecMoney * (toRational pct / toRational (100 + pct)))
        in (gross - vat, vat)
   _ -> (gross, 0)
+
+splitGrossByGstBreakup :: DTC.GstBreakup -> HighPrecMoney -> (HighPrecMoney, HighPrecMoney)
+splitGrossByGstBreakup breakup gross =
+  let totalPct =
+        fromMaybe 0 breakup.cgstPercentage
+          + fromMaybe 0 breakup.sgstPercentage
+          + fromMaybe 0 breakup.igstPercentage
+   in if totalPct > 0
+        then
+          let gst = HighPrecMoney (gross.getHighPrecMoney * (totalPct.getHighPrecMoney / (100 + totalPct.getHighPrecMoney)))
+           in (gross - gst, gst)
+        else (gross, 0)
+
+splitCancellationGross :: Bool -> DTC.TaxConfig -> HighPrecMoney -> (HighPrecMoney, HighPrecMoney)
+splitCancellationGross isVat taxCfg gross
+  | isVat = splitGrossByVatPct taxCfg.serviceVatPercentage gross
+  | otherwise = splitGrossByGstBreakup taxCfg.rideGst gross
 
 -- Time helpers (shared across getWalletTransactions, postWalletPayout, postWalletTopup)
 
