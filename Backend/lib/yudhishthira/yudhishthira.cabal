@@ -231,6 +231,7 @@ test-suite yudhishthira-tests
   main-is: Main.hs
   other-modules:
       KaalChakraJobs
+      LogicDomainRoundTrip
       Paths_yudhishthira
   hs-source-dirs:
       test/app

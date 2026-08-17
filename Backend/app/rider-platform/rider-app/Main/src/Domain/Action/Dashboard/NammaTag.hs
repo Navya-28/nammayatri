@@ -116,6 +116,7 @@ import SharedLogic.Merchant
 import SharedLogic.Offer
 import qualified SharedLogic.PickupETA as PickupETA
 import qualified SharedLogic.Scheduler.Jobs.Chakras as Chakras
+import qualified SharedLogic.TipModuleConfig as TipModuleConfig
 import Storage.Beam.SchedulerJob ()
 import Storage.Beam.Yudhishthira ()
 import qualified Storage.CachedQueries.BecknConfig as SQBecknConfig
@@ -371,6 +372,9 @@ postNammaTagAppDynamicLogicVerify merchantShortId opCity req = do
     LYTU.PICKUP_ETA_CALCULATION -> do
       logicData :: PickupETA.PickupETAInput <- YudhishthiraFlow.createLogicData def (Prelude.listToMaybe req.inputData)
       YudhishthiraFlow.verifyAndUpdateDynamicLogic mbMerchantid (cast merchantOpCityId) (Proxy :: Proxy PickupETA.PickupETAResult) _riderConfig.dynamicLogicUpdatePassword req logicData
+    LYTU.TIP_MODULE_CONFIG -> do
+      logicData :: TipModuleConfig.TipModuleConfigInput <- YudhishthiraFlow.createLogicData def (Prelude.listToMaybe req.inputData)
+      YudhishthiraFlow.verifyAndUpdateDynamicLogic mbMerchantid (cast merchantOpCityId) (Proxy :: Proxy TipModuleConfig.TipModuleConfig) _riderConfig.dynamicLogicUpdatePassword req logicData
     LYTU.RIDER_CONFIG LYTU.PayoutConfigRider -> do
       def' <- fromMaybeM (InvalidRequest "PayoutConfig not found") (Prelude.listToMaybe $ YTH.genDef (Proxy @DTP.PayoutConfig))
       let configWrap = LYTU.Config def' Nothing 1
@@ -597,6 +601,12 @@ getNammaTagAppDynamicLogicGetDomainSchema _mrchntShortId _opCity domain = do
         LYTU.DomainSchemaResp
           { LYTU.defaultValue = A.toJSON (def :: PickupETA.PickupETAInput),
             LYTU.schema = toInlinedSchemaValue (Proxy @PickupETA.PickupETAInput)
+          }
+    LYTU.TIP_MODULE_CONFIG ->
+      return $
+        LYTU.DomainSchemaResp
+          { LYTU.defaultValue = A.toJSON (def :: TipModuleConfig.TipModuleConfigInput),
+            LYTU.schema = toInlinedSchemaValue (Proxy @TipModuleConfig.TipModuleConfigInput)
           }
     LYTU.RIDER_CONFIG LYTU.PayoutConfigRider -> do
       def' <- fromMaybeM (InvalidRequest "PayoutConfig not found") (Prelude.listToMaybe $ YTH.genDef (Proxy @DTP.PayoutConfig))

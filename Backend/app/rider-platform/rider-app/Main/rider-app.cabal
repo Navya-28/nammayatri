@@ -592,6 +592,7 @@ library
       SharedLogic.TicketRule.Apply
       SharedLogic.TicketRule.Core
       SharedLogic.TicketUtils
+      SharedLogic.TipModuleConfig
       SharedLogic.TollDashboard
       SharedLogic.TollUpsert
       SharedLogic.Type
@@ -1938,6 +1939,7 @@ test-suite rider-app-test
   main-is: Main.hs
   other-modules:
       FRFS.DirectQR
+      TipModuleConfigRules
       Paths_rider_app
   hs-source-dirs:
       test
@@ -1988,6 +1990,7 @@ test-suite rider-app-test
     , beam-core
     , beam-mysql
     , beam-postgres
+    , beckn-spec
     , bytestring
     , casing
     , cassava

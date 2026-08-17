@@ -88,6 +88,7 @@ import qualified SharedLogic.MetroOffer as Metro
 import qualified SharedLogic.Offer as SOffer
 import SharedLogic.Quote
 import qualified SharedLogic.Search as SLS
+import qualified SharedLogic.TipModuleConfig as STMC
 import qualified Storage.CachedQueries.BppDetails as CQBPP
 import qualified Storage.CachedQueries.Translations as CQTranslations
 import qualified Storage.CachedQueries.ValueAddNP as CQVAN
@@ -489,6 +490,9 @@ getEstimates searchRequest _enableRideHailingOffers isReferredRide providerLooku
             Right r -> pure r
       else pure []
   let offerMap = Map.fromList productOffers
+  -- Fetched once per request: the rollout toss depends only on city + search id,
+  -- not on the estimate. Tip-module rules are skipped when the city has no RiderConfig.
+  tipModuleLogics <- maybe (pure []) (\rc -> STMC.fetchTipModuleConfigLogics rc.timeDiffFromUtc searchRequest.id searchRequest.merchantOperatingCityId) riderConfig
   estimates <- forM estimatesWithCtx $ \(estimate, mbBreakup, _) -> do
     let mbOfferResp = Map.lookup (show estimate.vehicleServiceTierType) offerMap
     mbOffer <- case mbOfferResp of
@@ -497,7 +501,19 @@ getEstimates searchRequest _enableRideHailingOffers isReferredRide providerLooku
       -- reflects VAT redistribution via applyRideDiscount.
       Just resp -> SOffer.mkCumulativeOfferResp searchRequest.merchantOperatingCityId resp [] mbBreakup
     (bppDetails, valueAddNP) <- lookupProvider providerLookup estimate.providerId
-    apiEntity <- UEstimate.mkEstimateAPIEntity isReferredRide mbOffer bppDetails valueAddNP estimate
+    mbTipModuleConfig <-
+      maybe
+        (pure Nothing)
+        ( \rc ->
+            STMC.resolveTipModuleConfig
+              rc
+              tipModuleLogics
+              searchRequest.id
+              searchRequest.merchantOperatingCityId
+              (STMC.mkTipModuleConfigInput valueAddNP estimate)
+        )
+        riderConfig
+    apiEntity <- UEstimate.mkEstimateAPIEntity isReferredRide mbOffer bppDetails valueAddNP mbTipModuleConfig estimate
     serviceTierName <- translateServiceTierText searchRequest.merchantOperatingCityId language apiEntity.serviceTierName
     serviceTierShortDesc <- translateServiceTierText searchRequest.merchantOperatingCityId language apiEntity.serviceTierShortDesc
     pure apiEntity {UEstimate.serviceTierName = serviceTierName, UEstimate.serviceTierShortDesc = serviceTierShortDesc}

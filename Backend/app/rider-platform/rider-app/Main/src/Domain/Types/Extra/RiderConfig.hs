@@ -125,3 +125,14 @@ data SyncSearchDispatchConfig = SyncSearchDispatchConfig
     fixedRoute :: Maybe RequestKindRule
   }
   deriving (Show, Eq, Ord, Generic, FromJSON, ToJSON, ToSchema)
+
+-- | Cadence for the rider-app "add tip" module shown during an active search.
+-- Produced per estimate by the TIP_MODULE_CONFIG JSON-logic domain from the
+-- estimate's QAR (quote acceptance rate); this record on RiderConfig is the
+-- per-city fallback when the rules yield nothing.
+data TipModuleConfig = TipModuleConfig
+  { showAfterSec :: Int, -- first prompt after N seconds of searching (from select2)
+    repeatIntervalSec :: Int, -- re-prompt cadence; 0 = never repeat
+    maxPrompts :: Int -- hard cap per search
+  }
+  deriving (Show, Eq, Ord, Generic, FromJSON, ToJSON, ToSchema)

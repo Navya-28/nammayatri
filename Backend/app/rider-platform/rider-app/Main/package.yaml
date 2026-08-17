@@ -250,3 +250,6 @@ tests:
       - time
       - text
       - bytestring
+      - aeson
+      - json-logic-hs
+      - beckn-spec
